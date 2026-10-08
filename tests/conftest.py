@@ -4,16 +4,36 @@ import numpy as np
 import pandas as pd
 import pytest
 
+LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
 
 @pytest.fixture(autouse=True)
 def block_network(monkeypatch):
-    """Tests must never open a network connection (no yfinance, no Anthropic API)."""
+    """Tests must never reach the internet (no yfinance, no Anthropic API).
 
-    def refuse(*args, **kwargs):
-        raise RuntimeError("tests must not open network connections")
+    Loopback stays allowed, because asyncio on Windows builds its self-pipe on
+    127.0.0.1. Any other destination raises.
+    """
+    real_connect = socket.socket.connect
+    real_create_connection = socket.create_connection
 
-    monkeypatch.setattr(socket.socket, "connect", refuse)
-    monkeypatch.setattr(socket, "create_connection", refuse)
+    def refuse(host):
+        raise RuntimeError(f"tests must not open network connections (tried {host!r})")
+
+    def guarded_connect(self, address):
+        host = address[0] if isinstance(address, tuple) else address
+        if host not in LOOPBACK:
+            refuse(host)
+        return real_connect(self, address)
+
+    def guarded_create_connection(address, *args, **kwargs):
+        host = address[0]
+        if host not in LOOPBACK:
+            refuse(host)
+        return real_create_connection(address, *args, **kwargs)
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket, "create_connection", guarded_create_connection)
 
 
 @pytest.fixture

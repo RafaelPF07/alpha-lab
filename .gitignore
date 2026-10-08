@@ -2,6 +2,7 @@
 .venv/
 .env
 .env.*
+!.env.example
 
 # Local data and run outputs (anchored to the repo root)
 /data/
