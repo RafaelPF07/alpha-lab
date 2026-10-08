@@ -1,5 +1,7 @@
 # Alpha Lab
 
+[![CI](https://github.com/RafaelPF07/alpha-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/RafaelPF07/alpha-lab/actions/workflows/ci.yml)
+
 A research harness for daily equity trading signals. The goal is not to find alpha. The goal is an honest, well-tested pipeline that resists lookahead bias, overfitting and data snooping.
 
 **Status: Phase 0 (deterministic core, no LLMs).** Later phases add agents, validation, the holdout, and a dashboard.
