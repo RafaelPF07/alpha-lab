@@ -157,7 +157,11 @@ def run_command(
         finally:
             printer.cancel()
 
-    summary = asyncio.run(main())
+    try:
+        summary = asyncio.run(main())
+    except anthropic.APIError as exc:
+        typer.echo(f"Anthropic API error, run {run_id} marked failed: {exc.message}", err=True)
+        raise typer.Exit(1) from None
     typer.echo("")
     typer.echo(f"Run {summary.run_id}: {summary.status}")
     typer.echo(f"  pipelines: {len(summary.results)}   train passes: {summary.train_passes}")

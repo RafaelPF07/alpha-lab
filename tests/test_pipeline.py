@@ -161,3 +161,16 @@ def test_budget_stops_the_run_cleanly(ledger):
     assert summary.results == []
     assert client.messages.calls == []
     assert ledger.get_run("test-run")["status"] == "budget_stopped"
+
+
+def test_unexpected_api_error_marks_the_run_failed(ledger):
+    import anthropic
+    import httpx2 as httpx
+
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    error = anthropic.BadRequestError(
+        "credit balance too low", response=httpx.Response(400, request=request), body=None
+    )
+    with pytest.raises(anthropic.BadRequestError):
+        run_with([error], ledger)
+    assert ledger.get_run("test-run")["status"] == "failed"

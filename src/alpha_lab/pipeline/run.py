@@ -98,6 +98,9 @@ async def execute_run(
     except asyncio.CancelledError:
         status = "interrupted"
         raise
+    except Exception:
+        status = "failed"
+        raise
     finally:
         ledger.finish_run(run_id, status, budget.spent_usd)
         bus.emit(
