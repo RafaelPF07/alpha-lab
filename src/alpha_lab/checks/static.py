@@ -13,8 +13,41 @@ from dataclasses import dataclass, field
 FORBIDDEN_CALLS = frozenset(
     {"open", "exec", "eval", "compile", "__import__", "getattr", "globals", "locals"}
 )
-# pandas and numpy have I/O helpers that read or write arbitrary paths.
-FORBIDDEN_ATTRIBUTE_PREFIXES = ("read_", "to_")
+# pandas and numpy have I/O helpers that read or write arbitrary paths. Only the
+# real I/O method names are blocked. A prefix like "to_" would also block to_frame.
+FORBIDDEN_IO_PREFIXES = ("read_",)
+FORBIDDEN_IO_METHODS = frozenset(
+    {
+        "to_csv",
+        "to_parquet",
+        "to_pickle",
+        "to_excel",
+        "to_json",
+        "to_hdf",
+        "to_sql",
+        "to_feather",
+        "to_stata",
+        "to_clipboard",
+        "to_html",
+        "to_latex",
+        "to_markdown",
+        "to_xml",
+        "to_orc",
+        "to_gbq",
+        "to_records_file",
+        "tofile",
+        "save",
+        "savez",
+        "savetxt",
+        "load",
+        "loadtxt",
+        "genfromtxt",
+        "fromfile",
+        "memmap",
+        "ExcelWriter",
+        "HDFStore",
+    }
+)
 FORBIDDEN_MODULE_NAMES = frozenset({"os", "sys", "subprocess", "socket", "pathlib"})
 
 
@@ -74,7 +107,7 @@ def static_check(code: str, allowed_imports: list[str]) -> StaticReport:
                 report.errors.append(
                     f"attribute access on {node.value.id!r} is forbidden ({_line(node)})"
                 )
-            if node.attr.startswith(FORBIDDEN_ATTRIBUTE_PREFIXES):
+            if node.attr.startswith(FORBIDDEN_IO_PREFIXES) or node.attr in FORBIDDEN_IO_METHODS:
                 report.errors.append(f"file I/O method {node.attr!r} is forbidden ({_line(node)})")
             if node.attr.startswith("__"):
                 report.errors.append(f"dunder attribute {node.attr!r} is forbidden ({_line(node)})")

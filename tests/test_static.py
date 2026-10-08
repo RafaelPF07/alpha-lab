@@ -78,3 +78,8 @@ def test_syntax_error_is_reported():
     report = check("def signal(prices:\n")
     assert not report.ok
     assert "syntax error" in report.errors[0]
+
+
+def test_pandas_methods_that_merely_start_with_to_are_allowed():
+    report = check(GOOD.replace("return score", "_ = score.to_frame()\n    return score"))
+    assert report.ok, report.errors
