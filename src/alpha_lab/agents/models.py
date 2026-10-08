@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -25,4 +27,16 @@ class CoderOutput(BaseModel):
         min_length=20,
         max_length=20_000,
         description="Full Python source. It must define signal(prices) and nothing else needs to run.",
+    )
+
+
+class CriticOutput(BaseModel):
+    concerns: list[str] = Field(
+        max_length=10, description="Specific concerns. Empty if none. Each one short and concrete."
+    )
+    suspicion_level: Literal["low", "medium", "high"] = Field(
+        description="high means the result is probably an artefact of lookahead or overfitting."
+    )
+    suggested_change: str = Field(
+        max_length=800, description="One concrete change to the code, or 'none'."
     )

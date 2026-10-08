@@ -31,8 +31,15 @@ def signal(prices: pd.DataFrame) -> pd.DataFrame:
     return (long.div(n_long, axis=0) - short.div(n_short, axis=0)).fillna(0.0)
 """
 
+LOW_CRITIC = {"concerns": [], "suspicion_level": "low", "suggested_change": "none"}
+
 IMPORTS_OS = "import os\n" + GOOD_CODE
 RAISES = "def signal(prices):\n    raise ValueError('nope')\n"
+
+
+def raising_code(i):
+    """Same behaviour every time, but a different token, so it is not a duplicate."""
+    return "def signal(prices):" + chr(10) + f"    raise ValueError('nope {i}')" + chr(10)
 
 
 def relaxed_settings():
@@ -91,11 +98,12 @@ def test_passing_pipeline_runs_end_to_end_and_keeps_validation_out(ledger):
     responses = [
         tool_response("submit_idea", IDEA),
         tool_response("submit_code", {"code": GOOD_CODE}),
+        tool_response("submit_critique", LOW_CRITIC),
     ]
     summary, client = run_with(responses, ledger)
 
     assert summary.status == "completed"
-    assert summary.results[0].status == "train_pass"
+    assert summary.results[0].status == "critic_pass"
     assert summary.results[0].attempts == 1
     assert ledger.count_trials() == 1
     assert summary.total_cost_usd > 0
@@ -130,10 +138,11 @@ def test_static_failure_is_fed_back_to_the_coder(ledger):
         tool_response("submit_idea", IDEA),
         tool_response("submit_code", {"code": IMPORTS_OS}),
         tool_response("submit_code", {"code": GOOD_CODE}),
+        tool_response("submit_critique", LOW_CRITIC),
     ]
     summary, client = run_with(responses, ledger)
 
-    assert summary.results[0].status == "train_pass"
+    assert summary.results[0].status == "critic_pass"
     assert summary.results[0].attempts == 2
     revision_prompt = client.messages.calls[2]["messages"][0]["content"]
     assert "Static check failed" in revision_prompt
@@ -144,7 +153,7 @@ def test_revisions_are_capped_and_every_attempt_is_a_counted_trial(ledger):
     settings = relaxed_settings()
     max_attempts = settings.agents.max_revisions + 1
     responses = [tool_response("submit_idea", IDEA)] + [
-        tool_response("submit_code", {"code": RAISES}) for _ in range(max_attempts)
+        tool_response("submit_code", {"code": raising_code(i)}) for i in range(max_attempts)
     ]
     summary, client = run_with(responses, ledger, settings=settings)
 

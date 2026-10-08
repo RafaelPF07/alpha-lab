@@ -1,7 +1,11 @@
-"""One idea -> code -> checks -> train backtest -> revise loop.
+"""One idea -> dedup -> code -> checks -> train backtest -> critic -> revise loop.
 
 This stage only ever sees prices up to train_end. Validation and holdout
 data never reach an agent, a sandbox or an event payload.
+
+Attempt statuses, in funnel order:
+  failed_static, rejected_duplicate_code, failed_sandbox, failed_lookahead,
+  failed_gate, failed_critic, critic_pass
 """
 
 from __future__ import annotations
@@ -16,16 +20,20 @@ from typing import Any
 import pandas as pd
 
 from alpha_lab.agents.coder import Revision, write_signal_code
+from alpha_lab.agents.critic import critique_signal
 from alpha_lab.agents.ideas import generate_idea
 from alpha_lab.agents.llm import ContextLimitExceeded, LLMClient, PromptSpec, StepFailed
-from alpha_lab.agents.models import CoderOutput, IdeaOutput
+from alpha_lab.agents.models import CoderOutput, CriticOutput, IdeaOutput
 from alpha_lab.backtest.engine import run_backtest
+from alpha_lab.checks.dedup import idea_similarity, normalised_code_hash
 from alpha_lab.checks.lookahead import LookaheadResult, run_lookahead_tests
 from alpha_lab.checks.sandbox import SandboxedSignal, SandboxFailure, SandboxOutcome
 from alpha_lab.checks.static import static_check
 from alpha_lab.config import Settings
 from alpha_lab.events.bus import EventBus, PipelineEvent
 from alpha_lab.ledger.db import Ledger
+
+IDEA_RETRIES_ON_DUPLICATE = 2
 
 
 @dataclass(frozen=True)
@@ -38,6 +46,7 @@ class PipelineContext:
     bus: EventBus
     idea_prompt: PromptSpec
     coder_prompt: PromptSpec
+    critic_prompt: PromptSpec
 
 
 @dataclass(frozen=True)
@@ -45,14 +54,16 @@ class PipelineResult:
     pipeline_id: str
     status: str
     idea_name: str | None
+    theme: str
     attempts: int
 
 
 @dataclass(frozen=True)
 class AttemptOutcome:
-    status: str  # train_pass | failed_static | failed_sandbox | failed_lookahead | failed_gate
+    status: str
     failure: str | None = None
     metrics: dict[str, Any] | None = None
+    critic: CriticOutput | None = None
 
 
 def code_hash(code: str) -> str:
@@ -83,21 +94,56 @@ def _emit(
     )
 
 
-async def run_single_pipeline(ctx: PipelineContext) -> PipelineResult:
+async def _draft_unique_idea(ctx: PipelineContext, pipeline_id: str, theme: str) -> IdeaOutput:
+    """Ask for ideas until one is not a near-copy of the ledger. Rejected ones are logged."""
     settings = ctx.settings
-    pipeline_id = uuid.uuid4().hex
-    _emit(ctx, "pipeline_started", "pipeline", pipeline_id, None, None, None, {})
-
-    try:
+    threshold = settings.dedup.similarity_threshold
+    for _ in range(IDEA_RETRIES_ON_DUPLICATE + 1):
         idea = await generate_idea(
             ctx.llm,
             prompt=ctx.idea_prompt,
             model=settings.agents.ideas_model,
             recent_ideas=list(ctx.ledger.recent_ideas(30)),
+            theme=theme,
             pipeline_id=pipeline_id,
         )
+        best_score, best_id = 0.0, None
+        for old in ctx.ledger.all_ideas():
+            score = idea_similarity(idea.name, idea.description, old["name"], old["description"])
+            if score > best_score:
+                best_score, best_id = score, old["idea_id"]
+        if best_score < threshold:
+            return idea
+        ctx.ledger.add_rejected_idea(
+            rejection_id=uuid.uuid4().hex,
+            run_id=ctx.run_id,
+            pipeline_id=pipeline_id,
+            name=idea.name,
+            similar_to_idea_id=best_id,
+            similarity=best_score,
+        )
+        _emit(
+            ctx,
+            "idea_rejected_duplicate",
+            "ideas",
+            pipeline_id,
+            None,
+            None,
+            "ideas",
+            {"name": idea.name, "similarity": round(best_score, 3), "threshold": threshold},
+        )
+    raise StepFailed("ideas kept duplicating earlier ideas")
+
+
+async def run_single_pipeline(ctx: PipelineContext, theme: str) -> PipelineResult:
+    settings = ctx.settings
+    pipeline_id = uuid.uuid4().hex
+    _emit(ctx, "pipeline_started", "pipeline", pipeline_id, None, None, None, {"theme": theme})
+
+    try:
+        idea = await _draft_unique_idea(ctx, pipeline_id, theme)
     except (StepFailed, ContextLimitExceeded) as exc:
-        return _finish(ctx, pipeline_id, "failed_ideas", None, 0, str(exc))
+        return _finish(ctx, pipeline_id, "failed_ideas", None, theme, 0, str(exc))
 
     idea_id = uuid.uuid4().hex
     ctx.ledger.add_idea(
@@ -108,6 +154,7 @@ async def run_single_pipeline(ctx: PipelineContext) -> PipelineResult:
         hypothesis=idea.hypothesis,
         description=idea.description,
         expected_holding_period_days=idea.expected_holding_period_days,
+        theme=theme,
     )
     _emit(
         ctx,
@@ -122,6 +169,7 @@ async def run_single_pipeline(ctx: PipelineContext) -> PipelineResult:
             "hypothesis": idea.hypothesis,
             "description": idea.description,
             "expected_holding_period_days": idea.expected_holding_period_days,
+            "theme": theme,
         },
     )
 
@@ -136,7 +184,7 @@ async def run_single_pipeline(ctx: PipelineContext) -> PipelineResult:
             idea_id=idea_id,
         )
     except (StepFailed, ContextLimitExceeded) as exc:
-        return _finish(ctx, pipeline_id, "failed_coder", idea, 0, str(exc))
+        return _finish(ctx, pipeline_id, "failed_coder", idea, theme, 0, str(exc))
 
     status = "failed"
     attempts = 0
@@ -145,7 +193,7 @@ async def run_single_pipeline(ctx: PipelineContext) -> PipelineResult:
         attempts = attempt_number
         outcome = await _check_attempt(ctx, pipeline_id, idea_id, idea, code, attempt_number)
         status = outcome.status
-        if status == "train_pass":
+        if status == "critic_pass":
             break
         if attempt_number == max_attempts:
             break
@@ -175,10 +223,9 @@ async def run_single_pipeline(ctx: PipelineContext) -> PipelineResult:
                 idea_id=idea_id,
             )
         except (StepFailed, ContextLimitExceeded) as exc:
-            status = "failed_coder"
-            return _finish(ctx, pipeline_id, status, idea, attempts, str(exc))
+            return _finish(ctx, pipeline_id, "failed_coder", idea, theme, attempts, str(exc))
 
-    return _finish(ctx, pipeline_id, status, idea, attempts, None)
+    return _finish(ctx, pipeline_id, status, idea, theme, attempts, None)
 
 
 def _finish(
@@ -186,6 +233,7 @@ def _finish(
     pipeline_id: str,
     status: str,
     idea: IdeaOutput | None,
+    theme: str,
     attempts: int,
     error: str | None,
 ) -> PipelineResult:
@@ -197,12 +245,13 @@ def _finish(
         None,
         None,
         None,
-        {"status": status, "attempts": attempts, "error": error},
+        {"status": status, "attempts": attempts, "error": error, "theme": theme},
     )
     return PipelineResult(
         pipeline_id=pipeline_id,
         status=status,
         idea_name=idea.name if idea else None,
+        theme=theme,
         attempts=attempts,
     )
 
@@ -218,6 +267,8 @@ async def _check_attempt(
     settings = ctx.settings
     allowed = settings.sandbox.allowed_imports
     digest = code_hash(code.code)
+    normalised = normalised_code_hash(code.code)
+    earlier = ctx.ledger.find_normalised_code(normalised)  # checked before this attempt is stored
     attempt_id = ctx.ledger.add_attempt(
         attempt_id=uuid.uuid4().hex,
         idea_id=idea_id,
@@ -225,6 +276,7 @@ async def _check_attempt(
         attempt_number=attempt_number,
         code=code.code,
         code_hash=digest,
+        normalised_hash=normalised,
         status="running",
     )
 
@@ -232,8 +284,19 @@ async def _check_attempt(
         _emit(ctx, event_type, stage, pipeline_id, idea_id, attempt_number, agent, payload)
 
     emit(
-        "code_written", "coder", {"code_hash": digest, "lines": code.code.count("\n") + 1}, "coder"
+        "code_written",
+        "coder",
+        {"code_hash": digest, "lines": len(code.code.splitlines())},
+        "coder",
     )
+
+    if earlier is not None:
+        failure = (
+            "Duplicate code: this is the same program as an earlier attempt, apart from comments "
+            "and formatting. Write a genuinely different implementation."
+        )
+        emit("static_check", "static", {"ok": False, "errors": [failure], "warnings": []})
+        return _record(ctx, attempt_id, "rejected_duplicate_code", failure, None, static_ok=False)
 
     report = static_check(code.code, allowed)
     emit(
@@ -302,13 +365,12 @@ async def _check_attempt(
             lookahead_ok=False,
         )
 
-    backtest = settings.backtest
     result = run_backtest(
         outcome.weights,
         ctx.train_prices,
         settings.dates.start,
         settings.dates.train_end,
-        backtest,
+        settings.backtest,
     )
     metrics = {k: float(v) for k, v in asdict(result.metrics).items()}
     emit("train_backtest", "train", metrics)
@@ -337,15 +399,60 @@ async def _check_attempt(
             lookahead_ok=True,
         )
 
+    critic = await critique_signal(
+        ctx.llm,
+        prompt=ctx.critic_prompt,
+        model=settings.agents.critic_model,
+        idea_name=idea.name,
+        hypothesis=idea.hypothesis,
+        code=code.code,
+        metrics=metrics,
+        pipeline_id=pipeline_id,
+        idea_id=idea_id,
+    )
+    emit(
+        "critic_review",
+        "critic",
+        {
+            "suspicion_level": critic.suspicion_level,
+            "concerns": critic.concerns,
+            "suggested_change": critic.suggested_change,
+        },
+        "critic",
+    )
+    ctx.ledger.update_attempt(
+        attempt_id,
+        critic_json=critic.model_dump_json(),
+        suspicion_level=critic.suspicion_level,
+    )
+    if critic.suspicion_level == "high":
+        failure = (
+            "The critic rated this signal as high suspicion, probably an artefact. Concerns: "
+            + "; ".join(critic.concerns or ["none given"])
+            + f". Suggested change: {critic.suggested_change}"
+        )
+        return _record(
+            ctx,
+            attempt_id,
+            "failed_critic",
+            failure,
+            metrics,
+            static_ok=True,
+            sandbox_ok=True,
+            lookahead_ok=True,
+            critic=critic,
+        )
+
     return _record(
         ctx,
         attempt_id,
-        "train_pass",
+        "critic_pass",
         None,
         metrics,
         static_ok=True,
         sandbox_ok=True,
         lookahead_ok=True,
+        critic=critic,
     )
 
 
@@ -359,6 +466,7 @@ def _record(
     static_ok: bool,
     sandbox_ok: bool | None = None,
     lookahead_ok: bool | None = None,
+    critic: CriticOutput | None = None,
 ) -> AttemptOutcome:
     ctx.ledger.update_attempt(
         attempt_id,
@@ -369,7 +477,7 @@ def _record(
         error=failure,
         train_metrics_json=None if metrics is None else json.dumps(metrics),
     )
-    return AttemptOutcome(status=status, failure=failure, metrics=metrics)
+    return AttemptOutcome(status=status, failure=failure, metrics=metrics, critic=critic)
 
 
 def _iso(value: pd.Timestamp | None) -> str | None:

@@ -50,3 +50,33 @@ class _Messages:
 class FakeAnthropic:
     def __init__(self, responses: list[Any]) -> None:
         self.messages = _Messages(responses)
+
+
+class RoutingAnthropic:
+    """Replies by tool name, so concurrent pipelines get the right answer regardless of call order.
+
+    Each tool has a queue of scripted replies. For submit_idea, an empty queue yields a
+    new, unique idea, so swarms never accidentally produce duplicates unless a test asks.
+    """
+
+    def __init__(self, scripts: dict[str, list[Any]], idea_factory: Any = None) -> None:
+        self._scripts = {k: list(v) for k, v in scripts.items()}
+        self._idea_factory = idea_factory
+        self._counter = 0
+        self.calls: list[dict[str, Any]] = []
+        self.messages = self
+
+    async def create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        tool = kwargs["tools"][0]["name"]
+        queue = self._scripts.get(tool, [])
+        if queue:
+            item = queue.pop(0)
+        elif tool == "submit_idea" and self._idea_factory is not None:
+            self._counter += 1
+            item = tool_response("submit_idea", self._idea_factory(self._counter))
+        else:
+            raise AssertionError(f"no scripted reply left for {tool}")
+        if isinstance(item, BaseException):
+            raise item
+        return item

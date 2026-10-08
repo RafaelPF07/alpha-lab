@@ -26,6 +26,7 @@ from alpha_lab.data.splits import split_window
 from alpha_lab.events.bus import EventBus, PipelineEvent
 from alpha_lab.ledger.db import Ledger
 from alpha_lab.pipeline.run import execute_run
+from alpha_lab.pipeline.swarm import SwarmProgress
 from alpha_lab.signals.baselines import SIGNALS
 
 app = typer.Typer(help="Alpha Lab command line.", no_args_is_help=True)
@@ -121,8 +122,9 @@ async def _print_events(queue: asyncio.Queue[PipelineEvent]) -> None:
 def run_command(
     pipelines: int = typer.Option(1, "--pipelines", min=1, help="How many pipelines to run."),
     budget: float | None = typer.Option(None, "--budget", help="Spend limit in USD."),
+    verbose: bool = typer.Option(False, "--verbose", help="Print every event, not just progress."),
 ) -> None:
-    """Run the agent pipeline against the Anthropic API, within a budget."""
+    """Run the agent swarm against the Anthropic API, within a budget."""
     load_env_file()
     if not os.environ.get("ANTHROPIC_API_KEY"):
         typer.echo(
@@ -140,9 +142,23 @@ def run_command(
     queue = bus.subscribe()
     run_id = uuid.uuid4().hex[:12]
     client = anthropic.AsyncAnthropic(max_retries=0)  # retries are handled by LLMClient
+    holder: dict[str, SwarmProgress] = {}
+
+    async def heartbeat() -> None:
+        while True:
+            await asyncio.sleep(5)
+            p = holder.get("progress")
+            if p is not None:
+                typer.echo(
+                    f"  running {p.running:<3} done {p.done:<3}/{p.total:<3} passed {p.passed:<3}"
+                    f" spend ${p.spent_usd:.4f} of ${budget_usd:.2f}"
+                    f" ({p.spend_rate_per_min:.4f}/min)"
+                )
 
     async def main():
-        printer = asyncio.create_task(_print_events(queue))
+        tasks = [asyncio.create_task(heartbeat())]
+        if verbose:
+            tasks.append(asyncio.create_task(_print_events(queue)))
         try:
             return await execute_run(
                 run_id=run_id,
@@ -153,20 +169,28 @@ def run_command(
                 ledger=ledger,
                 bus=bus,
                 client=client,
+                progress_sink=holder,
             )
         finally:
-            printer.cancel()
+            for task in tasks:
+                task.cancel()
 
     try:
         summary = asyncio.run(main())
     except anthropic.APIError as exc:
         typer.echo(f"Anthropic API error, run {run_id} marked failed: {exc.message}", err=True)
         raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        typer.echo(f"Interrupted. Run {run_id} is recorded as interrupted in the ledger.", err=True)
+        raise typer.Exit(130) from None
+
     typer.echo("")
     typer.echo(f"Run {summary.run_id}: {summary.status}")
-    typer.echo(f"  pipelines: {len(summary.results)}   train passes: {summary.train_passes}")
+    typer.echo(
+        f"  pipelines finished: {len(summary.results)} of {pipelines}   critic passes: {summary.train_passes}"
+    )
     for status, count in sorted(summary.pipeline_statuses.items()):
-        typer.echo(f"    {status:<16}{count}")
+        typer.echo(f"    {status:<20}{count}")
     typer.echo(f"  cost: ${summary.total_cost_usd:.4f} of ${summary.budget_usd:.2f} budget")
 
 

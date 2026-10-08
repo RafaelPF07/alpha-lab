@@ -36,6 +36,22 @@ default_budget_usd = 2.0
 max_concurrency = 10
 seed = 42
 
+[dedup]
+similarity_threshold = 0.85       # reject an idea whose name+description is this similar to an earlier one
+
+[diversity]
+# One theme is drawn at random for each pipeline, using a seed derived from run.seed.
+themes = [
+    "momentum",
+    "mean reversion",
+    "volatility",
+    "cross-sectional ranking",
+    "sector rotation",
+    "seasonality",
+    "trend filters",
+    "pairs and relative value",
+]
+
 [sandbox]
 timeout_seconds = 30
 allowed_imports = ["numpy", "pandas", "math"]

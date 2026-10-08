@@ -1,4 +1,4 @@
-"""Ideas agent: proposes one daily-equity signal idea per call."""
+"""Ideas agent: proposes one daily-equity signal idea per call, within a diversity theme."""
 
 from __future__ import annotations
 
@@ -26,10 +26,12 @@ async def generate_idea(
     prompt: PromptSpec,
     model: str,
     recent_ideas: list,
+    theme: str,
     pipeline_id: str,
 ) -> IdeaOutput:
     user_text = (
         f"{format_avoid_list(recent_ideas[:AVOID_LIST_SIZE])}\n\n"
+        f"Theme for this idea: {theme}. Stay within this family of signals.\n"
         "Propose one new idea. Call the submit_idea tool."
     )
     result = await llm.structured_call(

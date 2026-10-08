@@ -72,6 +72,14 @@ class RunConfig(_Strict):
     seed: int
 
 
+class DedupConfig(_Strict):
+    similarity_threshold: float = Field(gt=0, le=1)
+
+
+class DiversityConfig(_Strict):
+    themes: list[str] = Field(min_length=1)
+
+
 class SandboxConfig(_Strict):
     timeout_seconds: int = Field(gt=0)
     allowed_imports: list[str]
@@ -100,6 +108,8 @@ class Settings(_Strict):
     agents: AgentsConfig
     run: RunConfig
     sandbox: SandboxConfig
+    dedup: DedupConfig
+    diversity: DiversityConfig
     pricing: PricingConfig
 
 
