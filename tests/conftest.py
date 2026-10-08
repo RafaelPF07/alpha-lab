@@ -1,6 +1,19 @@
+import socket
+
 import numpy as np
 import pandas as pd
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def block_network(monkeypatch):
+    """Tests must never open a network connection (no yfinance, no Anthropic API)."""
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("tests must not open network connections")
+
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket, "create_connection", refuse)
 
 
 @pytest.fixture

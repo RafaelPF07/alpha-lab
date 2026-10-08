@@ -40,3 +40,10 @@ def test_cli_refuses_holdout_split():
 def test_cli_rejects_unknown_signal():
     result = CliRunner().invoke(app, ["backtest", "not_a_signal"])
     assert result.exit_code == 2
+
+
+def test_network_access_is_blocked_in_tests():
+    import socket
+
+    with pytest.raises(RuntimeError, match="network"):
+        socket.create_connection(("example.com", 443), timeout=1)
