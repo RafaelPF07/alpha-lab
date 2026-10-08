@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tomllib
 from datetime import date
 from pathlib import Path
@@ -87,6 +88,7 @@ class ModelPricing(_Strict):
 class PricingConfig(_Strict):
     source: str
     verified_on: date
+    long_context_threshold_tokens: int = Field(gt=0)
     models: dict[str, ModelPricing]
 
 
@@ -115,6 +117,18 @@ class Universe(_Strict):
         if len(set(self.tickers)) != len(self.tickers):
             raise ValueError("universe contains duplicate tickers")
         return self
+
+
+def load_env_file(path: Path = PROJECT_ROOT / ".env") -> None:
+    """Load KEY=VALUE lines from .env into os.environ. Existing variables win. No dependency needed."""
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
 def load_settings(path: Path = CONFIG_DIR / "settings.toml") -> Settings:

@@ -45,6 +45,8 @@ allowed_imports = ["numpy", "pandas", "math"]
 source = "https://platform.claude.com/docs/en/about-claude/pricing"
 verified_on = "2026-10-08"
 
+long_context_threshold_tokens = 100000  # prompts above this use the *_over_100k prices
+
 [pricing.models.claude-haiku-5-5]
 input = 0.10
 output = 0.50
