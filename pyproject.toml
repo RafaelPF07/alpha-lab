@@ -1,0 +1,33 @@
+[project]
+name = "alpha-lab"
+version = "0.1.0"
+description = "Multi-agent trading-signal research harness (learning project)"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.4.6",
+    "pandas>=3.0.6",
+    "pyarrow>=25.0.1",
+    "pydantic>=2.14.0",
+    "typer>=0.27.3",
+    "yfinance>=1.7.0",
+]
+
+[project.scripts]
+lab = "alpha_lab.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.11.30,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src"]

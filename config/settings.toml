@@ -1,0 +1,58 @@
+# Alpha Lab settings. Validated with pydantic at startup (src/alpha_lab/config.py).
+
+[dates]
+start = "2010-01-01"
+train_end = "2018-12-31"
+validation_end = "2021-12-31"
+holdout_end = "2025-12-31"
+
+[data]
+ffill_limit_days = 3              # forward-fill gaps up to this many days
+max_missing_fraction = 0.02       # drop a ticker if more of its rows are missing
+flag_return_large = 0.15          # flag (never delete) daily moves beyond this
+flag_return_extreme = 0.50        # ...and mark these as extreme
+
+[backtest]
+cost_bps_per_side = 5.0
+max_gross_leverage = 1.0
+annualization_days = 252
+min_history_days = 260            # signal days before this are ignored
+
+[gates]
+min_train_sharpe = 0.5
+min_validation_sharpe = 0.3
+max_turnover_daily = 0.5
+
+[agents]
+ideas_model = "claude-haiku-5-5"
+coder_model = "claude-haiku-5-5"
+critic_model = "claude-sonnet-5-5"
+max_revisions = 3
+max_tokens_per_call = 4000
+context_limit_tokens = 90000      # stay under Haiku 5.5's 100K pricing threshold
+
+[run]
+default_budget_usd = 2.0
+max_concurrency = 10
+seed = 42
+
+[sandbox]
+timeout_seconds = 30
+allowed_imports = ["numpy", "pandas", "math"]
+
+# USD per million tokens. Verified by the project owner against this page on 2026-10-08.
+[pricing]
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+verified_on = "2026-10-08"
+
+[pricing.models.claude-haiku-5-5]
+input = 0.10
+output = 0.50
+input_over_100k = 0.50            # prompts above 100K tokens
+output_over_100k = 2.50
+cache_read = 0.01
+
+[pricing.models.claude-sonnet-5-5]
+input = 2.00
+output = 10.00
+cache_read = 0.10

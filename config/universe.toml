@@ -1,0 +1,16 @@
+# Approved universe. Survivorship bias: these are today's large caps, so results are optimistic.
+
+[universe]
+selection_rule = "The 9 original SPDR sector ETFs, plus large-cap US stocks that were already listed and trading continuously before 2010, as checked against yfinance history."
+
+# Launched 1998. All nine have data back to 2010.
+sector_etfs = ["XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY"]
+
+# Flagged in the data-quality summary: GE, T, MMM and ABT had major spinoffs, and yfinance adjusts for these unreliably.
+stocks = [
+  "AAPL", "MSFT", "AMZN", "XOM", "CVX", "JNJ", "PG", "KO", "PEP", "WMT",
+  "JPM", "BAC", "WFC", "C", "GS", "IBM", "INTC", "CSCO", "ORCL", "PFE",
+  "MRK", "ABT", "MDT", "AMGN", "HD", "MCD", "NKE", "DIS", "VZ", "T",
+  "CAT", "BA", "MMM", "HON", "UNP", "UPS", "LMT", "GE", "TXN", "QCOM",
+  "COST",
+]
