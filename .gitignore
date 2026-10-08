@@ -1,8 +1,16 @@
+# Environments and secrets
 .venv/
 .env
+.env.*
+
+# Local data and run outputs (anchored to the repo root)
 /data/
 /runs/
+
+# Large or generated files
+*.parquet
 __pycache__/
+*.pyc
 .pytest_cache/
 .ruff_cache/
 *.egg-info/

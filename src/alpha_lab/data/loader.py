@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Protocol
 
 import pandas as pd
 
@@ -155,7 +156,7 @@ def fetch_and_cache(
 
     pre = cleaned[cleaned.index <= pd.Timestamp(dates.validation_end)]
     report = CleaningReport(
-        fetched_at=datetime.now().isoformat(timespec="seconds"),
+        fetched_at=datetime.now(UTC).isoformat(timespec="seconds"),
         first_date=pre.index.min().date().isoformat(),
         last_date=pre.index.max().date().isoformat(),
         tickers_requested=list(universe.tickers),
