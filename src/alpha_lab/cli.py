@@ -24,7 +24,7 @@ from alpha_lab.data.loader import (
 )
 from alpha_lab.data.splits import split_window
 from alpha_lab.events.bus import EventBus, PipelineEvent
-from alpha_lab.ledger.db import Ledger
+from alpha_lab.ledger.db import LEDGER_PATH, Ledger
 from alpha_lab.pipeline.run import execute_run
 from alpha_lab.pipeline.swarm import SwarmProgress
 from alpha_lab.signals.baselines import SIGNALS
@@ -253,6 +253,130 @@ def ledger_show(
             f"  {r['agent']:<8}{r['model']:<20}calls {r['calls']:<4}"
             f"in {r['input_tokens']:<8}out {r['output_tokens']:<8}${r['cost_usd']:.4f}"
         )
+
+
+@app.command("report")
+def report_command(
+    run: str | None = typer.Option(None, "--run", help="Run ID. Default: the latest run."),
+) -> None:
+    """Write the Markdown and HTML report for a run, with research figures."""
+    from alpha_lab.ledger.report import write_report
+
+    ledger = Ledger()
+    if run is None:
+        rows = ledger.list_runs(1)
+        if not rows:
+            typer.echo("No runs yet.", err=True)
+            raise typer.Exit(1)
+        run = rows[0]["run_id"]
+    if ledger.get_run(run) is None:
+        typer.echo(f"no run with id {run!r}", err=True)
+        raise typer.Exit(1)
+    path = write_report(ledger, run)
+    typer.echo(f"Report written to {path} (and report.html, figures/ next to it).")
+
+
+@app.command("holdout")
+def holdout_command(
+    run: str = typer.Option(..., "--run", help="Run ID whose validated signals are tested."),
+    top: int = typer.Option(
+        5, "--top", min=1, help="How many signals, best deflated Sharpe first."
+    ),
+    i_understand_this_is_final: bool = typer.Option(
+        False,
+        "--i-understand-this-is-final",
+        help="Required. Each signal gets exactly one holdout run, ever.",
+    ),
+) -> None:
+    """Run the one-time holdout test on the top validated signals. Human only."""
+    from alpha_lab.ledger.report import build_report_data
+    from alpha_lab.pipeline.holdout import HoldoutCandidate, HoldoutRefused, run_holdout
+
+    if not i_understand_this_is_final:
+        typer.echo(
+            "Refusing to run. The holdout is final and can be run once per signal.\n"
+            "Re-run with --i-understand-this-is-final if you mean it.",
+            err=True,
+        )
+        raise typer.Exit(2)
+
+    ledger = Ledger()
+    if ledger.get_run(run) is None:
+        typer.echo(f"no run with id {run!r}", err=True)
+        raise typer.Exit(1)
+    data = build_report_data(ledger, run)
+    survivors = [c for c in data.candidates if c.passed][:top]
+    if not survivors:
+        typer.echo("No validated signals in this run. Nothing to test.", err=True)
+        raise typer.Exit(1)
+
+    candidates = []
+    for c in survivors:
+        row = ledger.conn.execute(
+            "SELECT code FROM attempts WHERE attempt_id = ?", (c.attempt_id,)
+        ).fetchone()
+        candidates.append(HoldoutCandidate(attempt_id=c.attempt_id, name=c.name, code=row["code"]))
+
+    def confirm(items: list) -> bool:
+        typer.echo("About to run the holdout, once, on these signals:")
+        for item in items:
+            typer.echo(f"  - {item.name} ({item.attempt_id[:8]})")
+        return typer.confirm(
+            "This uses the holdout period and cannot be undone. Continue?", default=False
+        )
+
+    settings = load_settings()
+    try:
+        results = run_holdout(
+            ledger=ledger,
+            run_id=run,
+            settings=settings,
+            candidates=candidates,
+            i_understand_this_is_final=True,
+            confirm=confirm,
+        )
+    except HoldoutRefused as exc:
+        typer.echo(f"Refused: {exc}", err=True)
+        raise typer.Exit(1) from None
+
+    by_id = {c.attempt_id: c for c in survivors}
+    for r in results:
+        c = by_id[r.attempt_id]
+        typer.echo(f"{r.name}")
+        typer.echo(
+            f"  train SR {c.train_sharpe:.3f}   validation SR {c.validation_sharpe:.3f}   deflated SR {c.deflated_sharpe:.3f}"
+        )
+        if r.metrics:
+            m = r.metrics
+            typer.echo(
+                f"  holdout SR {m['sharpe']:.3f}   ann. return {m['ann_return']:+.2%}   max DD {m['max_drawdown']:.2%}"
+            )
+        else:
+            typer.echo(f"  holdout status: {r.status} ({r.error})")
+
+
+@app.command("dashboard")
+def dashboard_command(
+    run: str | None = typer.Option(None, "--run", help="Open this run on mission control."),
+    demo: bool = typer.Option(False, "--demo", help="Stream a synthetic demo run. No API calls."),
+    port: int = typer.Option(8000, "--port", help="Port to serve on."),
+) -> None:
+    """Serve the dashboard at http://localhost:8000."""
+    import uvicorn
+
+    from alpha_lab.config import PROJECT_ROOT
+    from alpha_lab.dashboard.server import create_app
+
+    ledger_path = PROJECT_ROOT / "runs" / "demo.db" if demo else LEDGER_PATH
+    if demo:
+        typer.echo("Demo mode: streaming a synthetic run into runs/demo.db. No API calls are made.")
+    typer.echo(f"Dashboard at http://localhost:{port}" + (f"/?run={run}" if run else "/"))
+    uvicorn.run(
+        create_app(ledger_path=ledger_path, demo=demo),
+        host="127.0.0.1",
+        port=port,
+        log_level="warning",
+    )
 
 
 def main() -> None:
