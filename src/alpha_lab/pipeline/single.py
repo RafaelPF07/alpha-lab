@@ -25,6 +25,7 @@ from alpha_lab.agents.ideas import generate_idea
 from alpha_lab.agents.llm import ContextLimitExceeded, LLMClient, PromptSpec, StepFailed
 from alpha_lab.agents.models import CoderOutput, CriticOutput, IdeaOutput
 from alpha_lab.backtest.engine import run_backtest
+from alpha_lab.backtest.holding import hold_weights
 from alpha_lab.checks.dedup import idea_similarity, normalised_code_hash
 from alpha_lab.checks.lookahead import LookaheadResult, run_lookahead_tests
 from alpha_lab.checks.sandbox import SandboxedSignal, SandboxFailure, SandboxOutcome
@@ -243,7 +244,11 @@ async def run_single_pipeline(ctx: PipelineContext, theme: str) -> PipelineResul
 
     if status == "critic_pass" and last is not None and last.attempt_id is not None:
         verdict = await asyncio.to_thread(
-            validate_signal, code.code, ctx.validation_prices, settings
+            validate_signal,
+            code.code,
+            ctx.validation_prices,
+            settings,
+            idea.expected_holding_period_days,
         )
         ctx.ledger.add_validation(
             last.attempt_id,
@@ -406,7 +411,7 @@ async def _check_attempt(
         )
 
     result = run_backtest(
-        outcome.weights,
+        hold_weights(outcome.weights, idea.expected_holding_period_days),
         ctx.train_prices,
         settings.dates.start,
         settings.dates.train_end,

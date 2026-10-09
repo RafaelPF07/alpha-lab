@@ -16,6 +16,7 @@ from pathlib import Path
 import pandas as pd
 
 from alpha_lab.backtest.engine import run_backtest
+from alpha_lab.backtest.holding import hold_weights
 from alpha_lab.checks.sandbox import SandboxedSignal
 from alpha_lab.config import DATA_DIR, Settings
 from alpha_lab.data import loader
@@ -32,6 +33,7 @@ class HoldoutCandidate:
     attempt_id: str
     name: str
     code: str
+    holding_days: int = 1
 
 
 @dataclass(frozen=True)
@@ -95,7 +97,8 @@ def run_holdout(
             outcome = sandboxed.run(full)
             if not outcome.ok:
                 raise RuntimeError(f"sandbox {outcome.status}: {outcome.message}")
-            result = run_backtest(outcome.weights, full, lower, upper, settings.backtest)
+            held = hold_weights(outcome.weights, candidate.holding_days)
+            result = run_backtest(held, full, lower, upper, settings.backtest)
             metrics = {k: float(v) for k, v in asdict(result.metrics).items()}
             ledger.update_holdout(candidate.attempt_id, "complete", metrics)
             results.append(

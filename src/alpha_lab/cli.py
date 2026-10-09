@@ -313,9 +313,15 @@ def holdout_command(
     candidates = []
     for c in survivors:
         row = ledger.conn.execute(
-            "SELECT code FROM attempts WHERE attempt_id = ?", (c.attempt_id,)
+            "SELECT a.code, i.expected_holding_period_days AS hold FROM attempts a "
+            "JOIN ideas i ON i.idea_id = a.idea_id WHERE a.attempt_id = ?",
+            (c.attempt_id,),
         ).fetchone()
-        candidates.append(HoldoutCandidate(attempt_id=c.attempt_id, name=c.name, code=row["code"]))
+        candidates.append(
+            HoldoutCandidate(
+                attempt_id=c.attempt_id, name=c.name, code=row["code"], holding_days=row["hold"]
+            )
+        )
 
     def confirm(items: list) -> bool:
         typer.echo("About to run the holdout, once, on these signals:")

@@ -24,6 +24,8 @@ def build_user_text(idea: IdeaOutput, revision: Revision | None) -> str:
         f"Hypothesis: {idea.hypothesis}\n"
         f"Description: {idea.description}\n"
         f"Expected holding period: {idea.expected_holding_period_days} trading days\n"
+        f"The harness takes your weights every {idea.expected_holding_period_days} trading days and holds them in between. "
+        "Write the signal for that rebalance frequency, not for daily trading.\n"
     )
     if revision is None:
         return text + "\nWrite the signal. Call the submit_code tool."

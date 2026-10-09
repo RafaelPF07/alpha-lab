@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass
 import pandas as pd
 
 from alpha_lab.backtest.engine import run_backtest
+from alpha_lab.backtest.holding import hold_weights
 from alpha_lab.checks.sandbox import SandboxedSignal
 from alpha_lab.config import Settings
 from alpha_lab.data.splits import split_window
@@ -26,7 +27,10 @@ class ValidationOutcome:
 
 
 def validate_signal(
-    code: str, validation_prices: pd.DataFrame, settings: Settings
+    code: str,
+    validation_prices: pd.DataFrame,
+    settings: Settings,
+    holding_days: int = 1,
 ) -> ValidationOutcome:
     """Run the signal on history up to validation_end, then score only the validation window."""
     prices = validation_prices.loc[: pd.Timestamp(settings.dates.validation_end)]
@@ -39,7 +43,8 @@ def validate_signal(
 
     lower, upper = split_window(settings.dates, "validation")
     try:
-        result = run_backtest(outcome.weights, prices, lower, upper, settings.backtest)
+        held = hold_weights(outcome.weights, holding_days)
+        result = run_backtest(held, prices, lower, upper, settings.backtest)
     except ValueError as exc:  # for example, the validation window has no data
         return ValidationOutcome(False, None, None, f"validation could not be scored: {exc}")
     metrics = {k: float(v) for k, v in asdict(result.metrics).items()}
