@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Alpha Lab · Research</title>
+  <link rel="stylesheet" href="/static/css/tokens.css">
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Alpha Lab · research</h1>
+    <span id="demo-badge" class="badge-demo" hidden>DEMO DATA</span>
+    <label>run <select id="run-select"></select></label>
+    <span id="run-note" class="mono" style="color:var(--muted)"></span>
+    <nav style="margin-left:auto">
+      <a href="/">mission control</a>
+      <a href="/replay">replay</a>
+      <a class="active" href="/research">research</a>
+    </nav>
+  </header>
+
+  <main class="grid">
+    <section class="panel span-8"><h2>Signal galaxy</h2>
+      <p class="note">Each point is a validated signal. Points below the dashed y = x line lost Sharpe between training and validation. Click a point to inspect it.</p>
+      <label class="note">colour by
+        <select id="galaxy-color"><option value="theme">theme</option><option value="revisions">revisions</option></select>
+      </label>
+      <div id="galaxy" class="chart tall"></div></section>
+    <section class="panel span-4"><h2>Luck distribution</h2>
+      <p class="note">Train Sharpe of every trial. The red line is the best Sharpe that pure noise would reach at this many trials.</p>
+      <div id="luck" class="chart tall"></div></section>
+
+    <section class="panel span-8"><h2>Equity curves, top 5 by deflated Sharpe</h2>
+      <p class="note">Shaded by period. The holdout stays grey and locked until its official run.</p>
+      <div id="equity" class="chart tall"></div></section>
+    <section class="panel span-4"><h2>Correlation map</h2>
+      <p class="note">Daily-return correlation between survivors. Above 0.7 suggests the same signal in disguise.</p>
+      <div id="correlation" class="chart tall"></div></section>
+
+    <section class="panel span-6"><h2>Drawdown</h2><div id="drawdown" class="chart"></div></section>
+    <section class="panel span-6"><h2>Theme leaderboard</h2><div id="themes" class="chart"></div></section>
+
+    <section class="panel span-6"><h2>Failure anatomy</h2><p class="note">Where attempts end, sized by count.</p><div id="failures" class="chart"></div></section>
+    <section class="panel span-6"><h2>Model economics</h2><p class="note">Cost and success rate per agent and model, across every run.</p><div id="economics" class="chart"></div></section>
+  </main>
+
+  <script type="module" src="/static/js/pages/research.js"></script>
+</body>
+</html>

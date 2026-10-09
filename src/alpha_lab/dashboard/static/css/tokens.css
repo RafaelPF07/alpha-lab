@@ -1,0 +1,152 @@
+/* Design tokens. One colour per stage, status and agent, used the same way everywhere. */
+:root {
+  color-scheme: dark;
+  --bg: #0b0e14;
+  --panel: #131821;
+  --panel-2: #1a2130;
+  --border: #242c3d;
+  --text: #e6eaf2;
+  --muted: #8a94a8;
+  --accent: #6ea8fe;
+
+  /* Stages */
+  --stage-idea: #7aa2f7;
+  --stage-code: #9ece6a;
+  --stage-static: #e0af68;
+  --stage-sandbox: #ff9e64;
+  --stage-lookahead: #f7768e;
+  --stage-train: #bb9af7;
+  --stage-critic: #7dcfff;
+  --stage-validation: #73daca;
+  --stage-holdout: #565f89;
+
+  /* Statuses */
+  --status-running: #6ea8fe;
+  --status-passed: #9ece6a;
+  --status-failed: #f7768e;
+  --status-rejected: #e0af68;
+  --status-budget: #ff9e64;
+
+  /* Agents */
+  --agent-ideas: #7aa2f7;
+  --agent-coder: #9ece6a;
+  --agent-critic: #7dcfff;
+
+  --font-ui: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 16px;
+  --space-4: 24px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --bg: #f5f6fa;
+    --panel: #ffffff;
+    --panel-2: #f0f2f8;
+    --border: #d9deea;
+    --text: #1b2130;
+    --muted: #5b6478;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 14px;
+}
+
+header.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+header.topbar h1 { font-size: 16px; margin: 0; font-weight: 600; }
+header.topbar nav a { color: var(--muted); margin-right: var(--space-3); text-decoration: none; }
+header.topbar nav a.active, header.topbar nav a:hover { color: var(--text); }
+
+.badge-demo {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--status-budget);
+  color: #111;
+}
+
+.grid {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: var(--space-3);
+  min-width: 0;
+}
+
+.panel h2 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 var(--space-2);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.panel .note { color: var(--muted); font-size: 12px; margin: 0 0 var(--space-2); }
+
+.span-3 { grid-column: span 3; }
+.span-4 { grid-column: span 4; }
+.span-6 { grid-column: span 6; }
+.span-8 { grid-column: span 8; }
+.span-12 { grid-column: span 12; }
+
+.chart { width: 100%; height: 280px; }
+.chart.tall { height: 420px; }
+.chart.short { height: 200px; }
+
+.counter { font-family: var(--font-mono); font-size: 28px; font-weight: 600; }
+.counter-label { color: var(--muted); font-size: 12px; }
+
+.ticker { height: 280px; overflow-y: auto; overflow-x: hidden; font-family: var(--font-mono); font-size: 12px; }
+.ticker .row { padding: 3px 0; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+.ticker .tag { display: inline-block; line-height: 1.5; }
+.ticker .row:hover { background: var(--panel-2); cursor: pointer; }
+.ticker .tag { padding: 0 6px; border-radius: 4px; color: #111; font-weight: 600; }
+
+.mono { font-family: var(--font-mono); }
+pre.code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--panel-2);
+  padding: var(--space-3);
+  border-radius: 8px;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.data th, table.data td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+table.data td.num, table.data th.num { text-align: right; font-family: var(--font-mono); }
+
+.locked { color: var(--stage-holdout); font-style: italic; }
+
+@media (max-width: 900px) {
+  .grid { grid-template-columns: 1fr; padding: var(--space-3); }
+  .span-3, .span-4, .span-6, .span-8, .span-12 { grid-column: span 1; }
+}

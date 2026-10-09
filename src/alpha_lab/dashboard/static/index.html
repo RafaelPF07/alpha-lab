@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Alpha Lab · Mission control</title>
+  <link rel="stylesheet" href="/static/css/tokens.css">
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Alpha Lab · mission control</h1>
+    <span id="demo-badge" class="badge-demo" hidden>DEMO DATA</span>
+    <label>run <select id="run-select"></select></label>
+    <span id="run-status" class="mono" style="color:var(--muted)"></span>
+    <nav style="margin-left:auto">
+      <a class="active" href="/">mission control</a>
+      <a href="/replay">replay</a>
+      <a href="/research">research</a>
+    </nav>
+  </header>
+
+  <main class="grid">
+    <section class="panel span-12"><h2>Headline</h2><div id="counters"></div></section>
+
+    <section class="panel span-8"><h2>Funnel</h2><p class="note">Signals that reached each stage. Drop-offs branch off in red.</p><div id="funnel" class="chart tall"></div></section>
+    <section class="panel span-4"><h2>Budget</h2><p class="note">Spent against this run's budget.</p><div id="gauge" class="chart tall"></div></section>
+
+    <section class="panel span-8"><h2>Pipeline swimlanes</h2><p class="note">One row per pipeline. Coloured bars are LLM calls. Dots are checks and backtests.</p>
+      <label class="note"><input type="checkbox" id="autoscroll" checked> auto-scroll</label>
+      <div id="swimlanes" class="chart tall"></div></section>
+    <section class="panel span-4"><h2>Event ticker</h2>
+      <input id="ticker-filter" placeholder="filter events" style="width:100%;margin-bottom:8px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px">
+      <div id="ticker"></div></section>
+
+    <section class="panel span-6"><h2>Cumulative spend</h2><p class="note">Dashed line projects when the budget runs out at the current rate.</p><div id="spend" class="chart"></div></section>
+    <section class="panel span-6"><h2>Cost by agent and model</h2><div id="spend-stack" class="chart"></div></section>
+
+    <section class="panel span-6"><h2>Context size</h2><p class="note">Input tokens per call. Solid line: the 100K pricing tier. Dashed: the context limit.</p><div id="context" class="chart"></div></section>
+    <section class="panel span-6"><h2>Agent swarm</h2><p class="note">Orchestrator, one cluster per pipeline. Click a node to open its pipeline.</p><div id="swarm" class="chart"></div></section>
+  </main>
+
+  <script type="module" src="/static/js/pages/mission.js"></script>
+</body>
+</html>

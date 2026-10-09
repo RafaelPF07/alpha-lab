@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Alpha Lab · Replay</title>
+  <link rel="stylesheet" href="/static/css/tokens.css">
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Alpha Lab · replay</h1>
+    <span id="demo-badge" class="badge-demo" hidden>DEMO DATA</span>
+    <label>run <select id="run-select"></select></label>
+    <nav style="margin-left:auto">
+      <a href="/">mission control</a>
+      <a class="active" href="/replay">replay</a>
+      <a href="/research">research</a>
+    </nav>
+  </header>
+
+  <section class="grid" style="padding-bottom:0">
+    <div class="panel span-12" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <button id="play" style="min-width:90px">play</button>
+      <span class="note">speed</span>
+      <button class="speed" data-speed="1">1×</button>
+      <button class="speed" data-speed="10">10×</button>
+      <button class="speed" data-speed="100">100×</button>
+      <input id="scrub" type="range" min="0" max="0" value="0" style="flex:1;min-width:200px">
+      <span id="clock" class="mono" style="color:var(--muted)"></span>
+    </div>
+  </section>
+
+  <main class="grid">
+    <section class="panel span-12"><h2>Headline</h2><div id="counters"></div></section>
+    <section class="panel span-8"><h2>Funnel</h2><div id="funnel" class="chart tall"></div></section>
+    <section class="panel span-4"><h2>Budget</h2><div id="gauge" class="chart tall"></div></section>
+    <section class="panel span-12"><h2>Pipeline swimlanes</h2><div id="swimlanes" class="chart tall"></div></section>
+    <section class="panel span-6"><h2>Cumulative spend</h2><div id="spend" class="chart"></div></section>
+    <section class="panel span-6"><h2>Cost by agent and model</h2><div id="spend-stack" class="chart"></div></section>
+  </main>
+
+  <script type="module" src="/static/js/pages/replay.js"></script>
+</body>
+</html>
