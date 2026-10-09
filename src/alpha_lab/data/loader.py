@@ -1,13 +1,18 @@
 """Fetch, clean and cache daily adjusted closes. The cache holds pre-holdout data only.
 
-The holdout window is never written to disk. pipeline/holdout.py downloads it in memory during
-`lab holdout`, and its SHA-256 goes into the ledger.
+This module never writes the holdout window. pipeline/holdout.py downloads it in memory during
+`lab holdout`, and its SHA-256 goes into the ledger. That module hands the window to candidate
+code. The in-process refusals in checks/sandbox_runner.py cover the spellings the reviewers found,
+but a candidate can still write the window by a route they do not cover. Nothing in this module
+prevents that (DECISION-4; see the README sandbox section).
 
 A fingerprint file beside the cache records the tickers, dates and cleaning settings the cache
-was built with. load_prices refuses a cache whose fingerprint does not match the current settings.
+was built with. Its digest and its body must both match the current settings, or the cache is
+refused. This is a consistency check on honest use. Anyone who can write the data directory can
+write a matching fingerprint too.
 
-Cleaning decisions that look at missingness use only the pre-holdout period, so a holdout-period
-gap cannot change which tickers are kept.
+Which tickers are kept is decided with the training window only (start to train_end), so neither
+validation nor holdout prices can change the universe (DECISION-15).
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -30,6 +36,10 @@ log = logging.getLogger(__name__)
 PRE_HOLDOUT_FILE = "prices_pre_holdout.parquet"
 FINGERPRINT_FILE = "cache_fingerprint.json"
 REPORT_FILE = "cleaning_report.json"
+# Version of the cleaning rule that decides which tickers are kept. 1 decided on all rows (before
+# DECISION-15). 2 decides on the training window only. A cache with any other value is refused, so
+# a cache built under the old universe rule cannot pass for the new one (R4-SEC-05).
+CLEANING_RULE = 2
 
 
 class CacheMismatch(RuntimeError):
@@ -84,30 +94,49 @@ class CleaningReport:
 def clean_prices(
     raw: pd.DataFrame, dates: Dates, data_cfg: DataConfig
 ) -> tuple[pd.DataFrame, dict[str, str]]:
-    """Drop badly-missing tickers, then forward-fill short gaps. Returns (cleaned, dropped).
+    """Drop tickers that are too incomplete in training, then forward-fill. Returns (cleaned, dropped).
 
-    Rows after validation_end are discarded here, so no holdout row can reach the cache.
+    Every decision about which tickers are kept uses the training window only (DECISION-15):
+    the missing-fraction limit and the check for gaps that forward-fill cannot close. Validation
+    rows are kept in the cache, but they cannot change the universe. Rows after validation_end are
+    discarded here, so no holdout row can reach the cache.
     """
     prices = raw.sort_index()
     prices = prices[~prices.index.duplicated(keep="first")]
     prices = prices.loc[: pd.Timestamp(dates.validation_end)]
+    train = prices.loc[: pd.Timestamp(dates.train_end)]
 
-    missing = prices.isna().mean()
+    missing = train.isna().mean()
 
     dropped: dict[str, str] = {}
     for ticker in prices.columns:
         frac = float(missing[ticker])
         if frac > data_cfg.max_missing_fraction:
             reason = (
-                f"{frac:.2%} of pre-holdout rows missing "
+                f"{frac:.2%} of training-window rows missing "
                 f"(limit {data_cfg.max_missing_fraction:.0%})"
             )
             dropped[ticker] = reason
             log.warning("dropping %s: %s", ticker, reason)
 
     kept = [t for t in prices.columns if t not in dropped]
-    cleaned = prices[kept].ffill(limit=data_cfg.ffill_limit_days).astype("float64")
-    return cleaned, dropped
+    filled = prices[kept].ffill(limit=data_cfg.ffill_limit_days).astype("float64")
+
+    # A gap longer than the fill limit leaves NaN. Any backtest whose window covers a training
+    # day with NaN fails, so the ticker is dropped here, not left to fail every run (R3-STAT-02).
+    residual = filled.loc[: pd.Timestamp(dates.train_end)].isna().sum()
+    for ticker in kept:
+        count = int(residual[ticker])
+        if count:
+            reason = (
+                f"{count} training-window day(s) still missing after forward fill "
+                f"(limit {data_cfg.ffill_limit_days} days)"
+            )
+            dropped[ticker] = reason
+            log.warning("dropping %s: %s", ticker, reason)
+
+    survivors = [t for t in kept if t not in dropped]
+    return filled[survivors], dropped
 
 
 def find_return_flags(pre_holdout: pd.DataFrame, data_cfg: DataConfig) -> list[dict]:
@@ -137,17 +166,30 @@ def write_cache(prices: pd.DataFrame, dates: Dates, data_dir: Path) -> None:
     prices[prices.index <= validation_end].to_parquet(data_dir / PRE_HOLDOUT_FILE)
 
 
-def read_pre_holdout(data_dir: Path = DATA_DIR) -> pd.DataFrame:
-    """Prices from start through validation_end. No fingerprint check; see read_checked_pre_holdout."""
-    return pd.read_parquet(data_dir / PRE_HOLDOUT_FILE)
+def read_pre_holdout(data_dir: Path = DATA_DIR, validation_end: date | None = None) -> pd.DataFrame:
+    """Prices from start through validation_end. No fingerprint check; see read_checked_pre_holdout.
+
+    With validation_end given, a cache that holds any later row is refused (CacheMismatch). The
+    cut is enforced on read, not only on write, because the file can be replaced by hand.
+    """
+    prices = pd.read_parquet(data_dir / PRE_HOLDOUT_FILE)
+    if validation_end is not None and len(prices.index):
+        latest = prices.index.max()
+        if latest > pd.Timestamp(validation_end):
+            raise CacheMismatch(
+                f"The price cache in {data_dir} has rows after validation_end ({validation_end}). "
+                "Run `lab data fetch --refresh` to rebuild it."
+            )
+    return prices
 
 
 def cache_fingerprint(settings: Settings, universe: Universe) -> dict[str, Any]:
-    """What the cache depends on: the tickers requested, the dates and the cleaning settings."""
+    """What the cache depends on: the tickers requested, the dates, the cleaning settings and the rule."""
     return {
         "tickers": list(universe.tickers),
         "dates": settings.dates.model_dump(mode="json"),
         "data": settings.data.model_dump(mode="json"),
+        "cleaning_rule": CLEANING_RULE,
     }
 
 
@@ -156,21 +198,34 @@ def _digest(fingerprint: dict[str, Any]) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _replace_text(path: Path, text: str) -> None:
+    """Write through a temporary file, so a reader never sees a half-written file."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def write_fingerprint(settings: Settings, universe: Universe, data_dir: Path = DATA_DIR) -> None:
     fingerprint = cache_fingerprint(settings, universe)
     data_dir.mkdir(parents=True, exist_ok=True)
     body = {"sha256": _digest(fingerprint), "fingerprint": fingerprint}
-    (data_dir / FINGERPRINT_FILE).write_text(json.dumps(body, indent=2), encoding="utf-8")
+    _replace_text(data_dir / FINGERPRINT_FILE, json.dumps(body, indent=2))
 
 
 def check_fingerprint(settings: Settings, universe: Universe, data_dir: Path = DATA_DIR) -> None:
-    """Raise CacheMismatch unless the cache was built for exactly these settings."""
-    expected = _digest(cache_fingerprint(settings, universe))
+    """Raise CacheMismatch unless the stored fingerprint equals the current settings in full.
+
+    Two things must hold: the stored body (tickers, dates and cleaning settings) equals what the
+    current settings produce, and the stored digest is the digest of that body. Comparing only
+    the digest, as before, accepted a file whose body had been edited.
+    """
+    current = cache_fingerprint(settings, universe)
     try:
-        stored = json.loads((data_dir / FINGERPRINT_FILE).read_text(encoding="utf-8"))["sha256"]
+        body = json.loads((data_dir / FINGERPRINT_FILE).read_text(encoding="utf-8"))
+        stored, digest = body["fingerprint"], body["sha256"]
     except (OSError, ValueError, KeyError, TypeError):
-        stored = None
-    if stored != expected:
+        stored, digest = None, None
+    if stored != current or digest != _digest(current):
         raise CacheMismatch(
             f"The price cache in {data_dir} was built for different settings (tickers, dates "
             "or cleaning rules), or it has no fingerprint. Run `lab data fetch --refresh` "
@@ -181,9 +236,9 @@ def check_fingerprint(settings: Settings, universe: Universe, data_dir: Path = D
 def read_checked_pre_holdout(
     settings: Settings, universe: Universe, data_dir: Path = DATA_DIR
 ) -> pd.DataFrame:
-    """Pre-holdout prices, but only if the cache matches the current settings."""
+    """Pre-holdout prices, but only if the cache matches the current settings and has no later rows."""
     check_fingerprint(settings, universe, data_dir)
-    return read_pre_holdout(data_dir)
+    return read_pre_holdout(data_dir, validation_end=settings.dates.validation_end)
 
 
 def fetch_and_cache(
@@ -200,6 +255,9 @@ def fetch_and_cache(
         dates.validation_end + timedelta(days=1),
     )
     cleaned, dropped = clean_prices(raw, dates, settings.data)
+    # The old fingerprint goes first and the new one is written last. A crash in between leaves
+    # no fingerprint, so the cache is refused, and it never passes for settings it was not built for.
+    (data_dir / FINGERPRINT_FILE).unlink(missing_ok=True)
     write_cache(cleaned, dates, data_dir)
     write_fingerprint(settings, universe, data_dir)
 
@@ -229,12 +287,16 @@ def load_prices(
     source: PriceSource | None = None,
     data_dir: Path = DATA_DIR,
 ) -> pd.DataFrame:
-    """Pre-holdout prices, fetching first if the cache is missing or `refresh` is set.
+    """Pre-holdout prices from the cache. Downloads only when `refresh` is set.
 
-    Raises CacheMismatch if the cache was built for other settings.
+    A missing cache is an error, not a silent download (R3-WHOLE-17): the user runs `lab data fetch`
+    and sees the dropped-ticker report. Raises CacheMismatch if the cache is missing or was built
+    for other settings.
     """
-    if refresh or not (data_dir / PRE_HOLDOUT_FILE).exists():
+    if refresh:
         fetch_and_cache(settings, universe, source or YFinanceSource(), data_dir)
+    elif not (data_dir / PRE_HOLDOUT_FILE).exists():
+        raise CacheMismatch(f"There is no price cache in {data_dir}. Run `lab data fetch` first.")
     return read_checked_pre_holdout(settings, universe, data_dir)
 
 

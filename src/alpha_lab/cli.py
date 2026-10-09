@@ -6,6 +6,7 @@ import asyncio
 import getpass
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -31,7 +32,7 @@ from alpha_lab.data.loader import (
 )
 from alpha_lab.data.splits import split_window
 from alpha_lab.events.bus import EventBus, PipelineEvent
-from alpha_lab.ledger.db import LEDGER_PATH, Ledger
+from alpha_lab.ledger.db import LEDGER_PATH, MIGRATIONS, Ledger
 from alpha_lab.pipeline.run import execute_run
 from alpha_lab.pipeline.swarm import SwarmProgress
 from alpha_lab.signals.baselines import SIGNALS
@@ -43,13 +44,46 @@ app.add_typer(data_app, name="data")
 app.add_typer(ledger_app, name="ledger")
 
 BACKTEST_SPLITS = ("train", "validation")
+GRACEFUL_SHUTDOWN_SECONDS = 3
 # Tests point these at temporary paths. Every command reads them at call time.
 RUNS_DIR = PROJECT_ROOT / "runs"
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
+OLDER_LEDGER_MESSAGE = (
+    "The ledger at {path} was written by an older version, so it is not read until it is "
+    "migrated. Run `lab ledger migrate` once, then retry."
+)
+
+
 def _open_ledger() -> Ledger:
+    """The read-write ledger. Only the commands that record something use it (run, holdout, migrate)."""
     return Ledger(LEDGER_PATH)
+
+
+def _schema_is_current(ledger: Ledger) -> bool:
+    """False for a ledger an older version wrote: a column from MIGRATIONS is missing, or events has no seq."""
+    for table, columns in MIGRATIONS.items():
+        present = {row["name"] for row in ledger.conn.execute(f"PRAGMA table_info({table})")}
+        if not set(columns) <= present:
+            return False
+    events = {row["name"] for row in ledger.conn.execute("PRAGMA table_info(events)")}
+    return "seq" in events
+
+
+def _open_ledger_read_only() -> Ledger | None:
+    """A read-only ledger, or None if there is no ledger file. Never creates or migrates the file.
+
+    An older schema is refused with a message and left as it is (R4-WHOLE-08, R4-AGT-13).
+    """
+    if not LEDGER_PATH.exists():
+        return None
+    ledger = Ledger(LEDGER_PATH, read_only=True)
+    if not _schema_is_current(ledger):
+        ledger.close()
+        typer.echo(OLDER_LEDGER_MESSAGE.format(path=LEDGER_PATH), err=True)
+        raise typer.Exit(1)
+    return ledger
 
 
 def _plain(text: str | None) -> str:
@@ -58,10 +92,40 @@ def _plain(text: str | None) -> str:
 
 
 def _stdin_is_tty() -> bool:
+    """True only for an interactive console. On Windows the null device also reports isatty() (R3-SEC-06)."""
     try:
-        return sys.stdin.isatty()
-    except (AttributeError, ValueError):
+        if not sys.stdin.isatty():
+            return False
+        fd = sys.stdin.fileno()
+        if os.name == "nt":
+            return _windows_console(fd)
+        null, here = os.stat(os.devnull), os.fstat(fd)
+    except (AttributeError, ValueError, OSError):
         return False
+    return (here.st_dev, here.st_ino) != (null.st_dev, null.st_ino)
+
+
+def _windows_console(fd: int) -> bool:
+    """GetConsoleMode succeeds only for a console handle, and it fails for the NUL device."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetConsoleMode.restype = wintypes.BOOL
+        mode = wintypes.DWORD()
+        return bool(kernel32.GetConsoleMode(msvcrt.get_osfhandle(fd), ctypes.byref(mode)))
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _metric(value: float | None, spec: str) -> str:
+    """A metric for display. A missing or non-finite value (a flat scoring window) prints as n/a."""
+    if value is None or not math.isfinite(value):
+        return "n/a"
+    return format(value, spec)
 
 
 def _current_user() -> str:
@@ -171,7 +235,11 @@ def run_command(
     verbose: bool = typer.Option(False, "--verbose", help="Print every event, not just progress."),
 ) -> None:
     """Run the agent swarm against the Anthropic API, within a budget."""
-    load_env_file()
+    try:
+        load_env_file()
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from None
     if not os.environ.get("ANTHROPIC_API_KEY"):
         typer.echo(
             "ANTHROPIC_API_KEY is not set. Add it to .env (never commit that file).", err=True
@@ -189,7 +257,8 @@ def run_command(
 
     ledger = _open_ledger()
     bus = EventBus(ledger)
-    queue = bus.subscribe()
+    # Only --verbose reads the event stream. A queue nobody drains would grow for the whole run.
+    queue = bus.subscribe() if verbose else None
     run_id = uuid.uuid4().hex[:12]
     client = anthropic.AsyncAnthropic(max_retries=0)  # retries are handled by LLMClient
     holder: dict[str, SwarmProgress] = {}
@@ -200,14 +269,15 @@ def run_command(
             p = holder.get("progress")
             if p is not None:
                 typer.echo(
-                    f"  running {p.running:<3} done {p.done:<3}/{p.total:<3} passed {p.passed:<3}"
+                    f"  running {p.running:<3} done {p.done:<3}/{p.total:<3}"
+                    f" passed critic {p.passed_critic:<3} passed validation {p.passed_validation:<3}"
                     f" spend ${p.spent_usd:.4f} of ${budget_usd:.2f}"
                     f" ({p.spend_rate_per_min:.4f}/min)"
                 )
 
     async def main():
         tasks = [asyncio.create_task(heartbeat())]
-        if verbose:
+        if queue is not None:
             tasks.append(asyncio.create_task(_print_events(queue)))
         try:
             return await execute_run(
@@ -233,11 +303,15 @@ def run_command(
     except KeyboardInterrupt:
         typer.echo(f"Interrupted. Run {run_id} is recorded as interrupted in the ledger.", err=True)
         raise typer.Exit(130) from None
+    finally:
+        if queue is not None:
+            bus.unsubscribe(queue)  # stop queueing events for a finished run
 
     typer.echo("")
     typer.echo(f"Run {summary.run_id}: {summary.status}")
     typer.echo(
-        f"  pipelines finished: {len(summary.results)} of {pipelines}   critic passes: {summary.train_passes}"
+        f"  pipelines finished: {len(summary.results)} of {pipelines}"
+        f"   passed critic: {summary.passed_critic}   passed validation: {summary.passed_validation}"
     )
     for status, count in sorted(summary.pipeline_statuses.items()):
         typer.echo(f"    {status:<20}{count}")
@@ -249,8 +323,15 @@ def ledger_show(
     run: str | None = typer.Option(None, "--run", help="Run ID. Omit to list recent runs."),
     code: bool = typer.Option(False, "--code", help="Print each attempt's code."),
 ) -> None:
-    """List runs, or show one run's ideas, checks, metrics and LLM cost."""
-    ledger = _open_ledger()
+    """List runs, or show one run's ideas, checks, metrics and LLM cost. Read-only: it never creates
+    or migrates the ledger."""
+    ledger = _open_ledger_read_only()
+    if ledger is None:
+        if run is None:
+            typer.echo("No runs yet. Try `lab run --pipelines 1 --budget 0.50`.")
+            return
+        typer.echo(f"No ledger at {LEDGER_PATH}. Run `lab run` first.", err=True)
+        raise typer.Exit(1)
     if run is None:
         rows = ledger.list_runs()
         if not rows:
@@ -289,8 +370,10 @@ def ledger_show(
             if attempt["train_metrics_json"]:
                 m = json.loads(attempt["train_metrics_json"])
                 typer.echo(
-                    f"    train: Sharpe {m['sharpe']:.3f}, ann. return {m['ann_return']:+.2%}, "
-                    f"max DD {m['max_drawdown']:.2%}, turnover {m['avg_daily_turnover']:.4f}"
+                    f"    train: Sharpe {_metric(m.get('sharpe'), '.3f')}, "
+                    f"ann. return {_metric(m.get('ann_return'), '+.2%')}, "
+                    f"max DD {_metric(m.get('max_drawdown'), '.2%')}, "
+                    f"turnover {_metric(m.get('avg_daily_turnover'), '.4f')}"
                 )
             if code and attempt["code"]:
                 typer.echo("    code:")
@@ -306,14 +389,26 @@ def ledger_show(
         )
 
 
+@ledger_app.command("migrate")
+def ledger_migrate() -> None:
+    """Upgrade the ledger file to the current schema. An explicit write: no API call is made, and the
+    file is created if it is missing. The read commands never migrate."""
+    ledger = _open_ledger()
+    ledger.close()
+    typer.echo(f"Ledger at {LEDGER_PATH} is at the current schema.")
+
+
 @app.command("report")
 def report_command(
     run: str | None = typer.Option(None, "--run", help="Run ID. Default: the latest run."),
 ) -> None:
-    """Write the Markdown and HTML report for a run, with research figures."""
+    """Write the Markdown and HTML report for a run, with research figures. Read-only on the ledger."""
     from alpha_lab.ledger.report import write_report
 
-    ledger = _open_ledger()
+    ledger = _open_ledger_read_only()
+    if ledger is None:
+        typer.echo(f"No ledger at {LEDGER_PATH}. Run `lab run` first.", err=True)
+        raise typer.Exit(1)
     if run is None:
         rows = ledger.list_runs(1)
         if not rows:
@@ -345,7 +440,7 @@ def holdout_command(
     ),
 ) -> None:
     """Run the one-time holdout test on validated signals. Human only, in a terminal."""
-    from alpha_lab.ledger.report import build_report_data
+    from alpha_lab.ledger.report import MIN_TRIALS_FOR_VARIANCE, build_report_data
     from alpha_lab.pipeline.holdout import HoldoutCandidate, HoldoutRefused, run_holdout
 
     if not i_understand_this_is_final:
@@ -380,6 +475,25 @@ def holdout_command(
             )
             raise typer.Exit(1)
     else:
+        if data.dsr_reason:
+            # The ranking behind --top is the deflated Sharpe. Without it, the order is not a
+            # correction for the number of trials, so --top refuses. --attempt is an explicit choice.
+            typer.echo(
+                f"Refusing --top: the deflated Sharpe is not defined for run {run!r} "
+                f"({data.dsr_reason}). Select attempts explicitly with --attempt.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        if data.n_train_trials < MIN_TRIALS_FOR_VARIANCE:
+            # R4-STAT-09: the trial variance behind the ranking rests on too few trials.
+            typer.echo(
+                f"Refusing --top: run {run!r} has {data.n_train_trials} trial(s) with a train "
+                f"Sharpe, and at least {MIN_TRIALS_FOR_VARIANCE} are needed to estimate the "
+                f"trial variance (ledger trials: {data.n_trials}). Select attempts explicitly "
+                "with --attempt.",
+                err=True,
+            )
+            raise typer.Exit(1)
         survivors = passed[:top]
     if not survivors:
         typer.echo("No validated signals in this run. Nothing to test.", err=True)
@@ -414,11 +528,12 @@ def holdout_command(
 
     settings = load_settings()
     universe = load_universe()
+    # The TTY check above refuses a piped or scripted run. It is not recorded: a recorded True
+    # proves nothing about a human, and it was always True in a written row (R4-SEC-07).
     invocation = {
         "argv": sys.argv,
         "user": _current_user(),
         "pid": os.getpid(),
-        "stdin_is_tty": True,
         "run_id": run,
     }
     try:
@@ -446,8 +561,9 @@ def holdout_command(
         c = by_id[r.attempt_id]
         typer.echo(_plain(r.name))
         typer.echo(
-            f"  train SR {c.train_sharpe:.3f}   validation SR {c.validation_sharpe:.3f}   "
-            f"deflated SR {c.deflated_sharpe:.3f}"
+            f"  train SR {_metric(c.train_sharpe, '.3f')}   "
+            f"validation SR {_metric(c.validation_sharpe, '.3f')}   "
+            f"deflated SR {_metric(c.deflated_sharpe, '.3f')}"
         )
         if r.status == "complete" and r.metrics:
             m = r.metrics
@@ -468,12 +584,36 @@ def dashboard_command(
     demo: bool = typer.Option(False, "--demo", help="Stream a synthetic demo run. No API calls."),
     port: int = typer.Option(8000, "--port", help="Port to serve on."),
 ) -> None:
-    """Serve the dashboard at http://localhost:8000."""
+    """Serve the dashboard at http://localhost:8000. Read-only: it never creates or migrates the ledger,
+    and it refuses a ledger written by an older version."""
     import uvicorn
 
     from alpha_lab.dashboard.server import create_app
 
     ledger_path = PROJECT_ROOT / "runs" / "demo.db" if demo else LEDGER_PATH
+    if not demo and ledger_path.exists():
+        # The dashboard only reads. An older schema is refused here, not migrated (R4-AGT-13).
+        probe = Ledger(ledger_path, read_only=True)
+        try:
+            current = _schema_is_current(probe)
+        finally:
+            probe.close()
+        if not current:
+            typer.echo(OLDER_LEDGER_MESSAGE.format(path=ledger_path), err=True)
+            raise typer.Exit(1)
+    if run is not None and not demo:
+        # The page for an unknown run would wait forever (R3-WHOLE-14). Check it here, read-only.
+        if not ledger_path.exists():
+            typer.echo(f"No ledger at {ledger_path}. Run `lab run` first.", err=True)
+            raise typer.Exit(1)
+        ledger = Ledger(ledger_path, read_only=True)
+        try:
+            found = ledger.get_run(run) is not None
+        finally:
+            ledger.close()
+        if not found:
+            typer.echo(f"no run with id {run!r}", err=True)
+            raise typer.Exit(1)
     if demo:
         typer.echo("Demo mode: streaming a synthetic run into runs/demo.db. No API calls are made.")
     typer.echo(f"Dashboard at http://localhost:{port}" + (f"/?run={run}" if run else "/"))
@@ -482,6 +622,8 @@ def dashboard_command(
         host="127.0.0.1",
         port=port,
         log_level="warning",
+        # An open event stream would otherwise hold the server, and the demo, as running (R3-BE-02).
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
     )
 
 

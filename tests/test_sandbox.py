@@ -3,6 +3,7 @@ import csv
 import http.server
 import io
 import os
+import socket
 import subprocess
 import sys
 import textwrap
@@ -243,10 +244,10 @@ def _spawner_script(pid_file: Path, linger: bool) -> str:
     wait = "pass" if linger else "time.sleep(120)"
     return (
         "import os, subprocess, sys, time\n"
+        "from pathlib import Path\n"
         f"child = subprocess.Popen([sys.executable, '-c', {GRANDCHILD!r}])\n"
         f"tmp = {str(pid_file) + '.tmp'!r}\n"
-        "with open(tmp, 'w') as f:\n"
-        "    f.write(f'{os.getpid()} {child.pid}')\n"
+        "Path(tmp).write_text(f'{os.getpid()} {child.pid}')\n"
         f"os.replace(tmp, {str(pid_file)!r})\n"
         f"{wait}\n"
     )
@@ -420,9 +421,10 @@ def test_kill_process_tree_takes_out_child_processes(tmp_path):
     pid_file = tmp_path / "child.pid"
     helper = (
         "import subprocess, sys, time, os\n"
+        "from pathlib import Path\n"
         f"child = subprocess.Popen([sys.executable, '-c', {GRANDCHILD!r}])\n"
         f"tmp = {str(pid_file) + '.tmp'!r}\n"
-        "open(tmp, 'w').write(str(child.pid))\n"
+        "Path(tmp).write_text(str(child.pid))\n"
         f"os.replace(tmp, {str(pid_file)!r})\n"
         "time.sleep(60)\n"
     )
@@ -521,7 +523,6 @@ def test_cleanup_failure_does_not_escape_run(prices, monkeypatch):
     # shutil reports each failure through a callback, so the locks are simulated on unlink/rmdir.
     import tempfile
 
-    before = _sandbox_dirs()
     real_unlink, real_rmdir = os.unlink, os.rmdir
 
     def locked(real):
@@ -535,12 +536,23 @@ def test_cleanup_failure_does_not_escape_run(prices, monkeypatch):
     monkeypatch.setattr(os, "unlink", locked(real_unlink))
     monkeypatch.setattr(os, "rmdir", locked(real_rmdir))
     monkeypatch.setattr(sandbox.time, "sleep", lambda _seconds: None)
+    created: list[str] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def record(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        created.append(path)
+        return path
+
+    monkeypatch.setattr(tempfile, "mkdtemp", record)
     try:
         outcome = run(GOOD_CODE, prices)
     finally:
         monkeypatch.undo()
-        for name in _sandbox_dirs() - before:  # leave nothing behind from the simulated lock
-            sandbox.shutil.rmtree(Path(tempfile.gettempdir()) / name, ignore_errors=True)
+        # Remove only the directory this test created. Other processes share the temp folder,
+        # and their sandbox runs need their own directories (R3-QA-01).
+        for directory in created:
+            sandbox.shutil.rmtree(directory, ignore_errors=True)
     assert outcome.status == "ok"
 
 
@@ -559,7 +571,400 @@ def test_windows_cleanup_is_retried_once(prices, monkeypatch):
     monkeypatch.setattr(sandbox.time, "sleep", lambda _seconds: None)
     outcome = run(GOOD_CODE, prices)
     assert outcome.status == "ok"
-    # The retry is the second call on the same work directory. TemporaryDirectory's own
-    # cleanup adds a further call afterwards, which is why the check is on the first two.
-    assert len(calls) >= 2
+    # One cleanup path: the failed attempt and its retry, on the same work directory, and nothing more.
+    assert len(calls) == 2
     assert calls[0] == calls[1]
+
+
+# ---- R4 (R3-SEC-01, -02, -03, -05): the child's runtime layer, with the static filter bypassed.
+# SandboxedSignal.run does not run the static filter, so these tests exercise the child alone.
+
+
+def test_process_creation_through_numpy_testing_is_refused(prices):
+    # R3-SEC-01, probe X2. The command is harmless, so the test shows only whether it ran.
+    code = (
+        "import numpy\n\ndef signal(prices):\n"
+        f"    numpy.testing.extbuild.run_subprocess([{sys.executable!r}, '-c', 'print(1)'])\n"
+        "    return prices * 0.0\n"
+    )
+    outcome = run(code, prices)
+    assert outcome.status == "exception", outcome
+    assert outcome.error_type == "PermissionError"
+    assert "process creation" in outcome.message
+
+
+def test_pyarrow_is_not_loaded_in_the_child(tmp_path, prices):
+    # R3-SEC-02, probe B03: the canary read through pandas' pyarrow must fail.
+    canary = tmp_path / "canary.txt"
+    canary.write_text("R4-CANARY-text\n", encoding="utf-8")
+    code = (
+        "import pandas\n\ndef signal(prices):\n"
+        f"    raise ValueError(pandas.compat.pyarrow.pa.OSFile({str(canary)!r}, 'rb').read().decode())\n"
+    )
+    outcome = run(code, prices)
+    assert outcome.status == "exception"
+    assert "R4-CANARY" not in (outcome.message or "")
+    assert outcome.error_type == "AttributeError"
+
+
+def test_pyarrow_cannot_be_imported_by_agent_code(prices):
+    code = "import pyarrow\n\ndef signal(prices):\n    return prices * 0.0\n"
+    outcome = run(code, prices)
+    assert outcome.status == "exception"
+    assert outcome.error_type == "ImportError"
+
+
+def test_a_dotted_import_of_a_denied_part_is_refused(prices):
+    # R3-SEC-01 and -02: numpy is allowed, but numpy.testing is not.
+    code = "import numpy.testing\n\ndef signal(prices):\n    return prices * 0.0\n"
+    outcome = run(code, prices)
+    assert outcome.status == "exception"
+    assert outcome.error_type == "ImportError"
+
+
+def test_to_string_cannot_write_a_file(tmp_path, prices):
+    # R3-SEC-03, probe H6: a candidate must not persist the frame it was given (the file is refused).
+    target = tmp_path / "written.txt"
+    code = (
+        "import pandas\n\ndef signal(prices):\n"
+        f"    prices.to_string(buf={str(target)!r})\n    return prices * 0.0 + 1.0\n"
+    )
+    outcome = run(code, prices)
+    assert not target.exists()
+    assert outcome.status == "exception", outcome
+    assert outcome.error_type == "PermissionError"
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        # R3-SEC-02 and -05, probes B05 and B06: stdlib file readers reached through numpy.
+        "''.join(numpy.f2py.crackfortran.fileinput.input(files=[{path!r}]))",
+        "numpy.f2py.crackfortran.codecs.open({path!r}, 'r', 'utf-8').read()",
+    ],
+)
+def test_stdlib_readers_reached_through_numpy_cannot_read_a_file(tmp_path, prices, reader):
+    canary = tmp_path / "canary.txt"
+    canary.write_text("R4-CANARY-text\n", encoding="utf-8")
+    code = (
+        "import numpy\n\ndef signal(prices):\n"
+        f"    raise ValueError(str({reader.format(path=str(canary))}))\n"
+    )
+    outcome = run(code, prices)
+    assert outcome.status == "exception"
+    assert "R4-CANARY" not in (outcome.message or "")
+
+
+def test_time_zone_conversion_still_runs_under_the_open_guard(prices):
+    # R3-SEC-05 trade-off: the stack-wide open() guard must not refuse ordinary library work.
+    code = (
+        "import pandas as pd\n\ndef signal(prices):\n"
+        "    idx = pd.DatetimeIndex(prices.index).tz_localize('UTC').tz_convert('US/Eastern')\n"
+        "    return prices * 0.0 + 1.0 / 3\n"
+    )
+    outcome = run(code, prices)
+    assert outcome.status == "ok", outcome
+
+
+def test_outcome_names_the_containment_that_ran(prices):
+    # R3-SEC-10: a fallback to taskkill must be visible to the owner through the outcome.
+    outcome = run(GOOD_CODE, prices)
+    assert outcome.containment in {"job-object", "process-group", "taskkill"}
+
+
+def test_scrub_ignores_case_and_replaces_the_repo_path():
+    # R3-SEC-15: Windows paths are case-insensitive, so an upper-case copy is scrubbed too.
+    upper = str(PROJECT_ROOT).upper()
+    forward = str(PROJECT_ROOT).replace("\\", "/")
+    scrubbed = sandbox._scrub(f"error in {upper} and {forward}")
+    assert scrubbed == "error in <path> and <path>"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="8.3 short names are a Windows feature")
+def test_scrub_replaces_the_eight_dot_three_form_of_a_path():
+    short = sandbox._short_path(str(PROJECT_ROOT))
+    if not short or short == str(PROJECT_ROOT):
+        pytest.skip("this volume has no 8.3 short name for the repository path")
+    assert sandbox._scrub(f"at {short}") == "at <path>"
+
+
+def test_the_child_environment_carries_no_price_data_or_secrets(prices, monkeypatch):
+    # R3-SEC-03: prices travel on stdin only. The child's environment has the four system variables
+    # and nothing else, so a key or a holdout value in the parent's environment never reaches it.
+    seen: dict[str, dict[str, str]] = {}
+    real_run_contained = sandbox.run_contained
+
+    def spy(cmd, *, cwd, env, **kwargs):
+        seen["env"] = dict(env)
+        return real_run_contained(cmd, cwd=cwd, env=env, **kwargs)
+
+    monkeypatch.setenv("ALPHA_R4_FAKE_SECRET", "not-a-real-key-for-tests")
+    monkeypatch.setattr(sandbox, "run_contained", spy)
+    assert run(GOOD_CODE, prices).ok
+    assert set(seen["env"]) <= {"SYSTEMROOT", "PATH", "TEMP", "TMP"}
+    assert "ALPHA_R4_FAKE_SECRET" not in seen["env"]
+
+
+# ---- R4-F6 items: the runner layer, traversal, and one owner for the work directory --------------
+
+
+def _load_runner():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("runner_layer_under_test", RUNNER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # the module guards its main() call, so this runs no agent code
+    return module
+
+
+def test_runner_layer_denies_import_parts_by_name():
+    runner = _load_runner()
+    assert runner._is_denied("testing")
+    assert runner._is_denied("_socket")  # a leading underscore does not get past the name check
+    assert runner._is_denied("__future__")
+    assert not runner._is_denied("numpy")
+    assert not runner._is_denied("pandas")
+
+
+def test_runner_layer_open_guard_sees_agent_code_below_library_frames():
+    # R3-SEC-05: a library frame sits between the agent and open(). The stack walk must still see it.
+    runner = _load_runner()
+
+    def library_open():  # stands in for a library frame that calls open()
+        return runner._agent_on_stack()
+
+    namespace = {"__name__": runner.AGENT_MODULE, "library_open": library_open}
+    exec("def agent_entry():\n    return library_open()\n", namespace)  # noqa: S102
+    assert namespace["agent_entry"]() is True
+    assert runner._agent_on_stack() is False  # this test module is not agent code
+
+
+def test_agent_code_cannot_read_through_dot_dot_segments(tmp_path, prices):
+    # Path traversal: a path that climbs out of its directory is refused by the open() guard.
+    secret = tmp_path / "secret.npy"
+    np.save(secret, np.arange(3))
+    traversal = str(tmp_path / "sub" / ".." / "secret.npy")
+    code = (
+        "import numpy as np\n\ndef signal(prices):\n"
+        f"    np.load({traversal!r})\n    return prices * 0.0\n"
+    )
+    outcome = run(code, prices)
+    assert outcome.status == "exception", outcome
+    assert outcome.error_type == "PermissionError"
+
+
+def test_a_normal_run_leaves_no_work_directory_behind(prices, monkeypatch):
+    # The work directory has one cleanup path. Track the directory this run creates. The temp folder
+    # is shared with other sandbox runs, so a before/after listing of it is not a reliable check.
+    created: list[str] = []
+    real_mkdtemp = sandbox.tempfile.mkdtemp
+
+    def record(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        created.append(path)
+        return path
+
+    monkeypatch.setattr(sandbox.tempfile, "mkdtemp", record)
+    assert run(GOOD_CODE, prices).ok
+    assert len(created) == 1
+    assert not Path(created[0]).exists()
+
+
+def test_the_repository_root_in_an_error_message_becomes_a_placeholder(prices):
+    # Item (f): the repository root never reaches an agent-facing message.
+    code = (
+        "def signal(prices):\n"
+        f"    raise ValueError('bad path ' + {str(PROJECT_ROOT)!r})\n"
+    )
+    outcome = run(code, prices)
+    assert outcome.status == "exception", outcome
+    assert "<path>" in outcome.message
+    assert str(PROJECT_ROOT) not in outcome.message
+
+
+def test_an_output_pipe_still_being_read_is_reported_as_its_own_outcome(prices, monkeypatch):
+    # R3-QA-01: the reader threads did not finish, so the frame may be short. That is not a crash.
+    def unfinished(cmd, *, cwd, env, stdin_data, timeout_seconds, **kwargs):
+        return ContainedRun(
+            timed_out=False,
+            returncode=0,
+            stdout=b"",
+            stdout_overflow=False,
+            stderr=b"",
+            containment="test",
+            readers_done=False,
+        )
+
+    monkeypatch.setattr(sandbox, "run_contained", unfinished)
+    outcome = run(GOOD_CODE, prices)
+    assert outcome.status == "exception"
+    assert outcome.error_type == "SandboxOutputIncomplete"
+
+
+# ---- R5-F3: routes that pass their own globals to __import__ and read frames (R4-SEC-01, -02, -06) --
+# Probes P0 to P12 are in scratchpad\review\round4\sec4. These tests run through SandboxedSignal.run,
+# which does not run the static filter, so each one exercises the runtime layer alone. The frame
+# attribute gi_frame is used only to reach the builtins table. The guard must refuse the import
+# whatever the caller passes as globals.
+
+GUARD_PRELUDE = (
+    "def signal(prices):\n"
+    "    g = (x for x in [1])\n"
+    "    imp = g.gi_frame.f_globals.get('__builtins__').get('__import__')\n"
+)
+
+
+@contextlib.contextmanager
+def _accepting_listener():
+    """A TCP listener on 127.0.0.1 that records every connection it accepts."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    srv.settimeout(0.2)
+    accepted: list[int] = []
+    stop = threading.Event()
+
+    def accept_loop() -> None:
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                continue
+            accepted.append(1)
+            conn.close()
+
+    thread = threading.Thread(target=accept_loop, daemon=True)
+    thread.start()
+    try:
+        yield srv.getsockname()[1], accepted
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        srv.close()
+
+
+def test_p0_control_import_without_a_globals_argument_is_refused(prices):
+    # The control: the guard refuses a direct __import__ from agent code. This held on HEAD too.
+    outcome = run(GUARD_PRELUDE + "    imp('os')\n    return prices * 0.0\n", prices)
+    assert outcome.status == "exception", outcome
+    assert outcome.error_type == "ImportError"
+    assert "not allowed in the sandbox" in outcome.message
+
+
+def test_p1_explicit_globals_naming_numpy_does_not_import_os(prices):
+    # R4-SEC-01, probe P1. On HEAD the guard read the importer from the globals argument, so os imported.
+    code = GUARD_PRELUDE + (
+        "    m = imp('os', {'__name__': 'numpy'})\n"
+        "    raise ValueError('IMPORTED os, name=' + m.name)\n"
+    )
+    outcome = run(code, prices)
+    assert outcome.error_type == "ImportError", outcome
+    assert "not allowed in the sandbox" in outcome.message
+
+
+@pytest.mark.parametrize("module", ["os", "_io", "_socket", "_winapi", "ctypes"])
+def test_explicit_globals_cannot_choose_the_importer(prices, module):
+    # R4-SEC-01 and R4-SEC-06. The refusal text is the guard's own, so a module that is missing on
+    # this platform (_winapi on POSIX) raises a different message and does not pass.
+    code = GUARD_PRELUDE + (
+        f"    m = imp({module!r}, {{'__name__': 'numpy'}})\n    raise ValueError('IMPORTED')\n"
+    )
+    outcome = run(code, prices)
+    assert outcome.error_type == "ImportError", outcome
+    assert "not allowed in the sandbox" in outcome.message, outcome.message
+
+
+def test_p2_os_reads_a_file_through_the_globals_argument_is_refused(tmp_path, prices):
+    # R4-SEC-01, probe P2: os.open and os.read, with no open() call for the guard to see.
+    canary = tmp_path / "canary.txt"
+    canary.write_text("R4-CANARY-text\n", encoding="utf-8")
+    code = GUARD_PRELUDE + (
+        "    m = imp('os', {'__name__': 'numpy'})\n"
+        f"    fd = m.open({str(canary)!r}, m.O_RDONLY)\n"
+        "    data = m.read(fd, 200)\n"
+        "    m.close(fd)\n"
+        "    raise ValueError('READ ' + data.decode())\n"
+    )
+    outcome = run(code, prices)
+    assert "R4-CANARY" not in (outcome.message or "")
+    assert outcome.error_type == "ImportError", outcome
+
+
+def test_p3b_tcp_connect_through_the_private_socket_module_is_refused(prices):
+    # R4-SEC-01, probe P3b: _socket.SocketType is not the class the runner patched.
+    with _accepting_listener() as (port, accepted):
+        code = GUARD_PRELUDE + (
+            "    m = imp('_socket', {'__name__': 'numpy'})\n"
+            "    s = m.SocketType(m.AF_INET, m.SOCK_STREAM)\n"
+            f"    s.connect(('127.0.0.1', {port}))\n"
+            "    s.close()\n"
+            "    raise ValueError('CONNECTED')\n"
+        )
+        outcome = run(code, prices)
+    assert accepted == [], "the loopback listener accepted a connection from agent code"
+    assert outcome.error_type == "ImportError", outcome
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="WinExec is a Windows API")
+def test_p4b_process_creation_through_ctypes_is_refused(tmp_path, prices):
+    # R4-SEC-01, probe P4b. The command writes a marker file, so the test shows whether it ran.
+    marker = tmp_path / "spawned.txt"
+    command = ("cmd /c echo R5-PROBE > " + str(marker)).encode()
+    code = GUARD_PRELUDE + (
+        "    m = imp('ctypes', {'__name__': 'numpy'})\n"
+        f"    m.windll.kernel32.WinExec({command!r}, 0)\n"
+        "    raise ValueError('SPAWNED')\n"
+    )
+    outcome = run(code, prices)
+    time.sleep(2)  # WinExec returns before the spawned command has written anything
+    assert not marker.exists()
+    assert outcome.error_type == "ImportError", outcome
+
+
+def test_p6_a_file_read_through_private_io_is_refused(tmp_path, prices):
+    # R4-SEC-01, probe P6: _io.FileIO reads the file without the open() guard.
+    canary = tmp_path / "canary.txt"
+    canary.write_text("R4-CANARY-text\n", encoding="utf-8")
+    code = GUARD_PRELUDE + (
+        "    m = imp('_io', {'__name__': 'numpy'})\n"
+        f"    raise ValueError('READ ' + m.FileIO({str(canary)!r}).read().decode())\n"
+    )
+    outcome = run(code, prices)
+    assert "R4-CANARY" not in (outcome.message or "")
+    assert outcome.error_type == "ImportError", outcome
+
+
+def test_p10b_a_static_clean_write_of_the_frame_through_private_io_is_refused(tmp_path, prices):
+    # R4-SEC-01 and R3-SEC-03, probe P10b: the frame written with no refused name in the code.
+    target = tmp_path / "frame.csv"
+    code = GUARD_PRELUDE + (
+        "    m = imp('_io', {'__name__': 'numpy'})\n"
+        f"    f = m.open({str(target)!r}, 'w')\n"
+        "    prices.agg('to_csv', 0, f)\n"
+        "    f.close()\n"
+        "    return prices * 0.0\n"
+    )
+    outcome = run(code, prices)
+    assert not target.exists(), "the frame was written to disk by agent code"
+    assert outcome.error_type == "ImportError", outcome
+
+
+def test_p12_the_frame_route_to_the_runner_main_locals_is_refused(prices):
+    # R4-SEC-02, probe P12: frame.f_back from a running generator reaches main(), whose locals held
+    # the real import function. The runtime layer must not hand it out.
+    code = (
+        "def signal(prices):\n"
+        "    holder = []\n"
+        "    def gen():\n"
+        "        yield holder[0].gi_frame.f_back\n"
+        "    g = gen()\n"
+        "    holder.append(g)\n"
+        "    sf = next(g)\n"
+        "    mf = sf.f_back\n"
+        "    real_import = mf.f_locals['real_import']\n"
+        "    os_mod = real_import('os')\n"
+        "    raise ValueError('main() locals reached; os module name=' + os_mod.name)\n"
+    )
+    outcome = run(code, prices)
+    assert "main() locals reached" not in (outcome.message or "")
+    assert outcome.status == "exception", outcome

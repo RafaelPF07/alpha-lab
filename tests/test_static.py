@@ -204,3 +204,139 @@ def test_syntax_error_is_reported():
 def test_pandas_methods_that_merely_start_with_to_are_allowed():
     report = check(with_statement("_ = score.to_frame()"))
     assert report.ok, report.errors
+
+
+# ---- R4: spellings from the round-3 probes (R3-SEC-01, -02, -03). Each one must be refused. -----
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        # R3-SEC-01: process creation through numpy's test helpers
+        "_ = numpy.testing.extbuild.run_subprocess(['cmd', '/c', 'echo', 'x'])",
+        "from numpy.testing import extbuild",
+        "import numpy.testing",
+        "from numpy.testing._private.extbuild import run_subprocess",
+        "import numpy.distutils",
+        "_ = score.process_spawn_check(run_subprocess)",
+        "_ = os_like.Popen(['x'])",
+        "_ = score.system('echo x')",
+        # R3-SEC-02: file and network I/O through pandas' bundled pyarrow and numpy's f2py
+        "_ = numpy.f2py.crackfortran.fileinput.input(files=['x'])",
+        "_ = numpy.f2py.crackfortran.codecs.open('x', 'r', 'utf-8')",
+        "import codecs",
+        "from numpy.f2py import crackfortran",
+        "_ = pandas.compat.pyarrow.pa.OSFile('x', 'rb')",
+        "_ = pandas.compat.pyarrow",
+        "_ = pa.fs.S3FileSystem(endpoint_override='127.0.0.1:1')",
+        "import pyarrow",
+        "from pyarrow import fs",
+        "import fileinput",
+        # R3-SEC-03: writes that persist the holdout window
+        "_ = score.to_string(buf='x')",
+        "_ = score.to_string('x')",
+        "_ = score.rank(path_or_buf='x')",
+        "_ = score.rank(filename='x')",
+        "score.savefig('x')",
+    ],
+)
+def test_round_three_spellings_are_refused(statement):
+    report = check(with_statement(statement))
+    assert not report.ok, statement
+
+
+def test_file_keyword_message_names_the_keyword():
+    report = check(with_statement("_ = score.rank(buf='x')"))
+    assert any("'buf'" in e for e in report.errors), report.errors
+
+
+def test_runtime_denylist_matches_the_static_list():
+    # The child refuses the same names at runtime. A name in only one list is a gap in one layer.
+    import importlib.util
+
+    from alpha_lab.checks import sandbox
+    from alpha_lab.checks.static import FORBIDDEN_MODULE_NAMES
+
+    spec = importlib.util.spec_from_file_location("runner_under_test", sandbox.RUNNER)
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    assert runner.DENIED_IMPORT_PARTS == FORBIDDEN_MODULE_NAMES
+
+
+def test_future_import_is_refused():
+    # The dead allowlist entry is gone. The dunder rule refuses __future__ on its own.
+    assert not check("from __future__ import annotations\n" + GOOD).ok
+
+
+# ---- R5-F3: frame attributes and the modules added in round five (R4-SEC-01, R4-SEC-02) ----------
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    ["f_back", "f_locals", "f_globals", "f_code", "gi_frame", "gi_code", "cr_frame", "ag_frame", "tb_frame"],
+)
+def test_frame_attributes_are_refused(attribute):
+    # R4-SEC-02: a frame reached through a generator, coroutine or traceback exposes the runner's locals.
+    report = check(with_statement(f"_ = g.{attribute}"))
+    assert not report.ok, attribute
+    assert any("frame attribute" in e for e in report.errors), report.errors
+
+
+def test_the_frame_route_probe_is_refused_statically():
+    # R4-SEC-02, probe P12 as written by the reviewer: the generator frame, then f_back, then f_locals.
+    code = (
+        "def signal(prices):\n"
+        "    holder = []\n"
+        "    def gen():\n"
+        "        yield holder[0].gi_frame.f_back\n"
+        "    g = gen()\n"
+        "    holder.append(g)\n"
+        "    sf = next(g)\n"
+        "    mf = sf.f_back\n"
+        "    return mf.f_locals['real_import']\n"
+    )
+    report = check(code)
+    assert not report.ok
+    assert len(report.errors) >= 3, report.errors
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        # R4-SEC-01: modules that reach a file or a process by a route the import guard had let through
+        "_ = _winapi.CreateProcess(None, 'x', None, None, False, 0, None, None, None)",
+        "_ = numpy.winapi.CreateProcess(None, 'x', None, None, False, 0, None, None, None)",
+        "_ = score.posixsubprocess",
+        "_ = msvcrt.getch()",
+        "_ = score.winreg",
+        "_ = score.pyio",
+        "import _pyio",
+    ],
+)
+def test_process_and_file_modules_added_in_round_five_are_refused(statement):
+    report = check(with_statement(statement))
+    assert not report.ok, statement
+
+
+def test_ordinary_attribute_names_are_not_caught_by_the_frame_prefixes():
+    # The prefixes are f_, gi_, cr_, ag_ and tb_. Common names that merely contain them are fine.
+    report = check(with_statement("_ = score.fillna(0.0).ffill().tb"))
+    assert report.ok, report.errors
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        # R4-SEC-02: DataFrame.eval and query resolve @names from the calling frame, so a string
+        # reaches frame objects with no attribute name in the code (probe: prices.eval("@g.gi_frame")).
+        "_ = prices.eval('@score')",
+        "_ = prices.eval('@g.gi_frame')",
+        "_ = prices.query('A > 0')",
+        "_ = pandas.eval('score')",
+        "from pandas import eval",
+    ],
+)
+def test_string_evaluators_are_refused(statement):
+    report = check(with_statement(statement))
+    assert not report.ok, statement
+    assert any("string evaluator" in e for e in report.errors), report.errors

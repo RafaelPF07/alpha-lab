@@ -1,17 +1,27 @@
 """The only module that reads holdout-period prices. Run by a human, once per idea.
 
-`lab holdout` is the only entry point. Holdout prices are never cached on disk. The holdout
-window is downloaded here, held in memory, and its SHA-256 is recorded with each run.
+`lab holdout` is the only entry point. This module does not cache the holdout window on disk. It
+is downloaded here, held in memory, and its SHA-256 is recorded with each run. Candidate code
+receives the window in memory. The in-process refusals (checks/static.py and the runner) stop the
+spellings the reviewers found, including the import route that passed a caller's globals (R4-SEC-01).
+A candidate can still write the window to a file by a route no list names, and the runner is not
+an operating-system boundary (R3-SEC-03, DECISION-4). The residual risk is documented in the README
+sandbox section, and it is the reason every candidate's code should be read before `lab holdout`
+runs. Nothing here closes that residual route.
 
 Order of operations. Each step is a precondition for the next:
   1. Flag and candidates. An idea that already has a holdout row is skipped (one run per idea).
+     The current static filter runs on each candidate's code. A refusal names the candidates and
+     claims nothing (R5-F3).
   2. The pre-holdout cache must match the current settings. No holdout data is read here.
   3. Confirmation from the caller. Nothing is written if it declines.
   4. Claim: every eligible candidate gets a 'running' row, in one transaction. The check runs
      again inside that transaction, so a second process cannot slip in between.
   5. Download the holdout window in memory, hash it, run each candidate, and record the result.
   6. Every claimed row ends as 'complete' or 'error'. A failure or an interrupt marks the
-     rows 'error', so the idea stays used.
+     rows 'error', so the idea stays used (DECISION-14). A hard kill (taskkill /F, a power cut)
+     runs no cleanup, so its rows stay 'running'. They still block a second run, and nothing
+     marks them stale yet (R3-SEC-11).
 """
 
 from __future__ import annotations
@@ -31,6 +41,7 @@ import pandas as pd
 from alpha_lab.backtest.engine import run_backtest
 from alpha_lab.backtest.holding import hold_weights
 from alpha_lab.checks.sandbox import SandboxedSignal
+from alpha_lab.checks.static import static_check
 from alpha_lab.config import DATA_DIR, Settings, Universe
 from alpha_lab.data import loader
 from alpha_lab.data.loader import PriceSource
@@ -177,6 +188,17 @@ def run_holdout(
             "two selected attempts belong to the same idea. Each idea gets one holdout run, "
             "so select one attempt (--attempt)."
         )
+    # Attribute reads have no runtime layer (R4-SEC-02). A candidate validated before a rule was
+    # added passed an older filter, so the current filter runs again here, before any claim.
+    refused = [
+        c for c in eligible if not static_check(c.code, settings.sandbox.allowed_imports).ok
+    ]
+    if refused:
+        names = ", ".join(c.name for c in refused)
+        raise HoldoutRefused(
+            f"the static filter refuses the code of: {names}. Nothing was claimed. "
+            "Select other attempts with --attempt."
+        )
 
     pre = loader.read_checked_pre_holdout(settings, universe, data_dir)
     if not confirm(eligible):
@@ -199,15 +221,17 @@ def run_holdout(
         for candidate in eligible:
             try:
                 metrics = _score(candidate, full, lower, upper, settings)
-                ledger.finish_holdout(candidate.attempt_id, "complete", metrics, sha)
-                results.append(
-                    HoldoutResult(candidate.attempt_id, candidate.name, "complete", metrics, None)
-                )
+                status, error = "complete", None
             except Exception as exc:  # noqa: BLE001 - recorded; the idea stays used
-                ledger.finish_holdout(candidate.attempt_id, "error", None, sha)
-                results.append(
-                    HoldoutResult(candidate.attempt_id, candidate.name, "error", None, str(exc))
-                )
+                metrics, status, error = None, "error", str(exc)
+            try:
+                ledger.finish_holdout(candidate.attempt_id, status, metrics, sha)
+            except ValueError as exc:  # no claimed row to write to (finish_holdout, R3-AGT-15)
+                metrics, status = None, "error"
+                error = f"the outcome could not be recorded: {exc}"
+            results.append(
+                HoldoutResult(candidate.attempt_id, candidate.name, status, metrics, error)
+            )
             pending.pop(candidate.attempt_id, None)
     except Exception as exc:  # noqa: BLE001 - the download or the setup failed
         _mark_pending_error(ledger, pending, sha)

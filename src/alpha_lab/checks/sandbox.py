@@ -5,13 +5,16 @@ What each platform enforces:
   limit, a job-wide memory limit and an active-process limit. Terminating the job kills every
   process in it, and closing the last handle does the same, so the tree also dies if this
   process is killed. If the job cannot be created or the child cannot be assigned to it, the
-  timeout falls back to `taskkill /T`, which misses grandchildren that have already been orphaned.
-- POSIX: the child leads its own process group. The whole group is killed on timeout and after
-  the child exits, so grandchildren do not outlive the run. If this process dies first, nothing
-  here kills the group; the child's own watchdog (sandbox_runner.py) covers that case.
+  timeout falls back to `taskkill /T`. That fallback does not kill orphans, and it does not kill
+  the tree if this process dies first. SandboxOutcome.containment names the mechanism that ran.
+- POSIX: the child leads its own process group, and the group is killed on timeout and after the
+  child exits. A grandchild that leaves the group (setsid, a double fork) is not killed, and
+  nothing else limits the process tree on POSIX. If this process dies first, nothing here kills
+  the group. This branch has not been run on a POSIX machine (CI is the first check).
 
 Neither platform restricts what the child can read, write or connect to. The child runs as the
-same operating-system user, so it can read anything that user can read, including .env.
+same operating-system user, so it can read anything that user can read, including .env. The
+in-process guards in sandbox_runner.py are a convenience layer, not isolation (DECISION-4).
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import functools
 import io
 import json
 import os
+import re
 import shutil
 import signal as posix_signal
 import subprocess
@@ -28,7 +32,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -63,6 +67,7 @@ class SandboxOutcome:
     error_type: str | None = None
     message: str | None = None
     traceback: str | None = None
+    containment: str | None = None  # job-object | process-group | taskkill, once a child ran
 
     @property
     def ok(self) -> bool:
@@ -83,6 +88,7 @@ class ContainedRun:
     stdout_overflow: bool
     stderr: bytes
     containment: str  # job-object | process-group | taskkill
+    readers_done: bool = True  # False when a pipe reader was still running after the join
 
 
 def kill_process_tree(proc: subprocess.Popen) -> None:
@@ -365,19 +371,23 @@ def run_contained(
     out = _Capture(proc.stdout, max_stdout, keep_tail=False)
     err = _Capture(proc.stderr, max_stderr, keep_tail=True)
     feeder = threading.Thread(target=_feed, args=(proc.stdin, stdin_data), daemon=True)
-    for thread in (out, err, feeder):
-        thread.start()
+    threads = (out, err, feeder)
 
     timed_out = False
     try:
-        proc.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+        # The threads start inside the try, so a failure to start one still reaches the cleanup.
+        for thread in threads:
+            thread.start()
+        try:
+            proc.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            timed_out = True
     finally:
         containment.kill()  # the whole tree, even when the leader has already exited
         proc.wait()
-        for thread in (out, err, feeder):
-            thread.join(timeout=JOIN_SECONDS)
+        for thread in threads:
+            if thread.ident is not None:  # only the threads that started can be joined
+                thread.join(timeout=JOIN_SECONDS)
         containment.close()
     return ContainedRun(
         timed_out=timed_out,
@@ -386,6 +396,7 @@ def run_contained(
         stdout_overflow=out.overflow,
         stderr=err.data,
         containment=containment.name,
+        readers_done=not any(thread.is_alive() for thread in threads),
     )
 
 
@@ -394,20 +405,65 @@ def _minimal_env() -> dict[str, str]:
     return {k: os.environ[k] for k in keep if k in os.environ}
 
 
+def _ns(index: pd.DatetimeIndex) -> np.ndarray:
+    """Dates as int64 nanoseconds. Comparing these ignores pandas' storage unit."""
+    return np.asarray(index.as_unit("ns").asi8)
+
+
 def _encode_prices(prices: pd.DataFrame) -> bytes:
+    """The child's input: a NumPy .npz archive, which the child reads without pickle."""
     buffer = io.BytesIO()
-    prices.to_parquet(buffer)
+    np.savez(
+        buffer,
+        index=_ns(prices.index),
+        columns=np.array([str(c) for c in prices.columns], dtype=str),
+        values=prices.to_numpy(dtype="float64"),
+    )
     return buffer.getvalue()
 
 
+def _decode_weights(body: bytes) -> pd.DataFrame:
+    """The child's output, read back with the same format. Pickles are refused."""
+    with np.load(io.BytesIO(body), allow_pickle=False) as arrays:
+        index = pd.DatetimeIndex(arrays["index"].view("datetime64[ns]"))
+        columns = [str(c) for c in arrays["columns"]]
+        values = arrays["values"]
+    return pd.DataFrame(values, index=index, columns=columns)
+
+
+def _short_path(path: str) -> str | None:
+    """The Windows 8.3 short form of a path, or None (not Windows, no short name, or an error)."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetShortPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        kernel32.GetShortPathNameW.restype = wintypes.DWORD
+        buffer = ctypes.create_unicode_buffer(1024)
+        length = kernel32.GetShortPathNameW(path, buffer, len(buffer))
+        return buffer.value if 0 < length < len(buffer) else None
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
 def _scrub(text: str) -> str:
-    """Replace the repo, temp and home directories with placeholders. Prompts never see them."""
+    """Replace the repo, temp and home directories with placeholders. Prompts never see them.
+
+    Matching ignores case, because Windows paths do, and it also replaces the 8.3 short form.
+    """
     roots = {str(PROJECT_ROOT), tempfile.gettempdir()}
     with contextlib.suppress(RuntimeError):
         roots.add(str(Path.home()))
+    for root in list(roots):
+        short = _short_path(root)
+        if short:
+            roots.add(short)
     for root in sorted(roots, key=len, reverse=True):
         for variant in {root, root.replace("\\", "/")}:
-            text = text.replace(variant, "<path>")
+            text = re.sub(re.escape(variant), "<path>", text, flags=re.IGNORECASE)
     return text
 
 
@@ -420,8 +476,8 @@ def _text(value, limit: int) -> str | None:
 def _remove_workdir(path: Path) -> None:
     """Remove the work directory. A Windows file can stay locked for a moment, so retry once.
 
-    TemporaryDirectory(ignore_cleanup_errors=True) is the last word. If the directory still cannot
-    be removed, it is left behind instead of raised out of run(). It holds only the agent's code.
+    This is the only cleanup. If the directory still cannot be removed, it is left behind instead of
+    raised out of run(). It holds only the agent's code.
     """
     for attempt in (1, 2):
         try:
@@ -476,7 +532,7 @@ def _parse_result(run: ContainedRun, prices: pd.DataFrame) -> SandboxOutcome:
     if run.returncode != 0 or header.get("bytes") != len(body):
         return _crash(run.stderr, "the sandbox reported a result it did not finish writing")
     try:
-        weights = pd.read_parquet(io.BytesIO(body))
+        weights = _decode_weights(body)
     except Exception as exc:  # noqa: BLE001 - any unreadable output is a wrong output
         return SandboxOutcome(
             status="wrong_output",
@@ -495,22 +551,22 @@ class SandboxedSignal:
         self.allowed_imports = allowed_imports
 
     def run(self, prices: pd.DataFrame) -> SandboxOutcome:
-        # Prices go in on stdin and the result comes back on stdout. The only file written to
-        # the work directory is the agent's own code, so holdout data never reaches the disk.
-        with tempfile.TemporaryDirectory(
-            prefix="alpha-sandbox-", ignore_cleanup_errors=True
-        ) as tmp:
-            workdir = Path(tmp)
-            try:
-                return self._run_in(workdir, prices)
-            except OSError as exc:  # the child could not be started
-                return SandboxOutcome(
-                    status="exception",
-                    error_type="SandboxLaunchError",
-                    message=_scrub(f"the sandbox could not be started: {exc}"),
-                )
-            finally:
-                _remove_workdir(workdir)
+        # Prices go in on stdin and the result comes back on stdout. This module writes only the
+        # agent's code to the work directory. The agent process receives the prices, and in-process
+        # guards do not stop it writing them somewhere else (R3-SEC-03, DECISION-4).
+        # One owner for the directory: this method creates it and removes it, exactly once. A
+        # second cleanup (TemporaryDirectory's own __exit__) raced the first on Windows.
+        workdir = Path(tempfile.mkdtemp(prefix="alpha-sandbox-"))
+        try:
+            return self._run_in(workdir, prices)
+        except OSError as exc:  # the child could not be started
+            return SandboxOutcome(
+                status="exception",
+                error_type="SandboxLaunchError",
+                message=_scrub(f"the sandbox could not be started: {exc}"),
+            )
+        finally:
+            _remove_workdir(workdir)
 
     def _run_in(self, workdir: Path, prices: pd.DataFrame) -> SandboxOutcome:
         code_path = workdir / "agent_signal.py"
@@ -530,12 +586,22 @@ class SandboxedSignal:
             stdin_data=_encode_prices(prices),
             timeout_seconds=self.timeout_seconds,
         )
+        if not run.readers_done and not run.timed_out:
+            # R3-QA-01: a short stdout read here looked like a child crash. It is reported as what it is.
+            return SandboxOutcome(
+                status="exception",
+                error_type="SandboxOutputIncomplete",
+                message="the sandbox output was still being read after the process ended; "
+                "the result was not used",
+                containment=run.containment,
+            )
         if run.timed_out:
             return SandboxOutcome(
                 status="timeout",
                 message=f"signal() did not finish within {self.timeout_seconds} seconds",
+                containment=run.containment,
             )
-        return _parse_result(run, prices)
+        return replace(_parse_result(run, prices), containment=run.containment)
 
     def __call__(self, prices: pd.DataFrame) -> pd.DataFrame:
         outcome = self.run(prices)
@@ -555,7 +621,10 @@ def _validate_output(weights: pd.DataFrame, prices: pd.DataFrame) -> SandboxOutc
             message=f"output unreadable: {exc}",
         )
 
-    if not weights.index.equals(prices.index):
+    same_dates = len(weights.index) == len(prices.index) and np.array_equal(
+        _ns(weights.index), _ns(prices.index)
+    )
+    if not same_dates:
         return SandboxOutcome(
             status="wrong_output",
             message=(
@@ -563,6 +632,7 @@ def _validate_output(weights: pd.DataFrame, prices: pd.DataFrame) -> SandboxOutc
                 f"to {prices.index[-1].date()}, got {len(weights.index)} rows"
             ),
         )
+    weights = weights.set_axis(prices.index, axis=0)  # the same index object as the input
     if list(weights.columns) != list(prices.columns):
         return SandboxOutcome(
             status="wrong_output",

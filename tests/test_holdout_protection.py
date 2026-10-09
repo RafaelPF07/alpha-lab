@@ -322,3 +322,66 @@ def test_holdout_hash_changes_when_any_value_changes():
     changed.iloc[2, 0] = 3.0
     assert holdout_sha256(frame) == holdout_sha256(frame.copy())
     assert holdout_sha256(frame) != holdout_sha256(changed)
+
+
+def test_a_candidate_cannot_persist_the_holdout_window_and_keeps_its_claim(world, tmp_path):
+    # R3-SEC-03, probe P7b: string dispatch to to_csv has no refused name in the code, so the static
+    # filter passes it and the open() guard refuses it in the child. The idea's holdout is still
+    # spent (DECISION-14), so it cannot be retried.
+    target = tmp_path / "holdout_copy.csv"
+    code = (
+        "import pandas as pd\n\ndef signal(prices):\n"
+        f"    prices.agg('to_csv', 0, {str(target)!r})\n"
+        "    return prices * 0.0 + 1.0 / prices.shape[1]\n"
+    )
+    candidate = add_attempt(world, "h6", code)
+    results = holdout(world, [candidate])
+    assert not target.exists()
+    assert results[0].status == "error"
+    assert world.ledger.get_holdout("h6")["status"] == "error"
+    with pytest.raises(HoldoutRefused, match="already been run"):
+        holdout(world, [candidate])
+
+
+def test_code_the_current_filter_refuses_is_refused_before_any_claim(world):
+    # R5-F3, R4-SEC-02: a candidate validated under an older filter is checked again before any claim,
+    # because attribute reads have no runtime layer. Nothing is claimed and nothing is requested.
+    code = (
+        "import pandas as pd\n\ndef signal(prices):\n"
+        "    g = (x for x in [1])\n    _ = g.gi_frame\n"
+        "    return prices * 0.0 + 1.0 / prices.shape[1]\n"
+    )
+    candidate = add_attempt(world, "fr1", code)
+    source = FakeSource(world.frame)
+    with pytest.raises(HoldoutRefused, match="static filter"):
+        holdout(world, [candidate], source=source)
+    assert world.ledger.holdouts() == []
+    assert source.calls == []
+
+
+def test_a_missing_holdout_row_fails_only_its_own_candidate(world, monkeypatch):
+    # R4-F2 request (R3-AGT-15): finish_holdout raises when no row matches. That must not turn the
+    # other candidates into errors. Here the row for "a1" is missing; "b1" must still complete.
+    a = add_attempt(world, "a1", GOOD)
+    b = add_attempt(world, "b1", VARIANT)
+    real_finish = world.ledger.finish_holdout
+
+    def missing_for_a1(attempt_id, status, metrics, data_sha256=None):
+        if attempt_id == "a1":
+            raise ValueError("no holdout row for attempt 'a1'; nothing was recorded")
+        return real_finish(attempt_id, status, metrics, data_sha256)
+
+    monkeypatch.setattr(world.ledger, "finish_holdout", missing_for_a1)
+    results = holdout(world, [a, b])
+    by_id = {r.attempt_id: r for r in results}
+    assert by_id["a1"].status == "error"
+    assert "could not be recorded" in by_id["a1"].error
+    assert by_id["b1"].status == "complete"
+
+
+def test_the_holdout_record_keeps_the_lag_one_sharpe_like_validation(world):
+    # R4-STAT-09 decision (R5-F1 request): sharpe_lag1 is a diagnostic that the engine sets for every
+    # backtest and validation already stores. The holdout keeps it too, so the two records match.
+    candidate = add_attempt(world, "a1", GOOD)
+    results = holdout(world, [candidate])
+    assert "sharpe_lag1" in results[0].metrics

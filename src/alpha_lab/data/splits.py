@@ -34,6 +34,16 @@ def split_window(dates: Dates, split: Split) -> tuple[date, date]:
     return windows[split]
 
 
+def holdout_dates(dates: Dates) -> tuple[date, date]:
+    """First and last date of the holdout window. Dates only: no prices are read or requested.
+
+    Dashboard code uses this for the shaded band on the equity chart (R3-WHOLE-05). It is defined
+    here, and not called with the literal "holdout" elsewhere, so the holdout tripwire in
+    tests/test_holdout_guard.py stays meaningful.
+    """
+    return split_window(dates, "holdout")
+
+
 def get_split(prices: pd.DataFrame, split: Split, dates: Dates) -> pd.DataFrame:
     """Return the rows of `prices` that fall inside the split's window."""
     lower, upper = split_window(dates, split)
