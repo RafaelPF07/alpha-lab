@@ -36,3 +36,8 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 src = ["src"]
+
+[tool.ruff.lint]
+# E501 (line length) is ignored for now: some lines are longer than line-length. Remove the ignore after they are wrapped.
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+ignore = ["E501"]
