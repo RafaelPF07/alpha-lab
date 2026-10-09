@@ -23,6 +23,18 @@ from alpha_lab.events.bus import EventBus, PipelineEvent
 from alpha_lab.ledger.db import Ledger
 
 MAX_ATTEMPTS = 4
+
+# Some models reject a forced tool choice with a 400 error. For those, the model is
+# asked to use the tool and the one-repair logic in structured_call handles a miss.
+MODELS_WITHOUT_FORCED_TOOL_CHOICE = frozenset({"claude-sonnet-5-5"})
+
+
+def _tool_choice(model: str, tool_name: str) -> dict[str, str]:
+    if model in MODELS_WITHOUT_FORCED_TOOL_CHOICE:
+        return {"type": "auto"}
+    return {"type": "tool", "name": tool_name}
+
+
 BACKOFF_BASE_SECONDS = 1.0
 CHARS_PER_TOKEN = 3.5  # conservative estimate, used instead of a count_tokens round trip
 
@@ -280,7 +292,7 @@ class LLMClient:
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
                 return await self.client.messages.create(
-                    tool_choice={"type": "tool", "name": kwargs["tool"]["name"]},
+                    tool_choice=_tool_choice(kwargs["model"], kwargs["tool"]["name"]),
                     tools=[kwargs["tool"]],
                     model=kwargs["model"],
                     max_tokens=kwargs["max_tokens"],
