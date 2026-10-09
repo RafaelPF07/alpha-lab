@@ -2,19 +2,26 @@
 
 Agents see training data only (prices through train_end). The validation gate runs once, after
 the revision loop, on history through validation_end. Holdout data never reaches an agent, a
-sandbox or an event payload. Every pipeline ends with exactly one pipeline_finished event.
+sandbox or an event payload.
 
-Attempt statuses (attempts.status). A failed attempt is followed by a revision, until the revision
-cap is reached, except failed_critic_output, which ends the pipeline:
+Every pipeline that starts gets exactly one pipeline_finished event, written in a finally. A
+process that is killed leaves its open pipelines without one, and Ledger.abandon_stale_runs writes
+them on a later run.
+
+The status sets are defined in alpha_lab.statuses (DECISION-13). Attempt statuses (attempts.status).
+A failed attempt is followed by a revision, until the revision cap is reached, except
+failed_critic_output, which ends the pipeline:
   failed_static, rejected_duplicate_code, failed_sandbox, failed_lookahead, failed_backtest,
   failed_gate, failed_critic, failed_critic_output, critic_pass,
   validation_pass, validation_fail (set on the last attempt only),
-  aborted_budget, aborted_error (an exception stopped the attempt)
+  aborted_budget, aborted_error (an exception stopped the attempt),
+  aborted_cancelled (the attempt was cancelled).
+The ledger reaper writes abandoned, not this module.
 
 Pipeline statuses (pipeline_finished and PipelineResult.status): the attempt statuses above, plus
   failed_ideas, failed_coder (the model gave no usable output),
   failed_api (the API failed after retries), failed_error (an unexpected error),
-  aborted_budget, aborted_error.
+  aborted_budget, aborted_error, aborted_cancelled.
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
+import sys
 import uuid
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -32,7 +40,7 @@ import pandas as pd
 from alpha_lab.agents.budget import BudgetExceeded
 from alpha_lab.agents.coder import Revision, write_signal_code
 from alpha_lab.agents.critic import critique_signal
-from alpha_lab.agents.ideas import generate_idea
+from alpha_lab.agents.ideas import AVOID_LIST_SIZE, generate_idea
 from alpha_lab.agents.llm import ContextLimitExceeded, LLMClient, PromptSpec, StepFailed
 from alpha_lab.agents.models import CoderOutput, CriticOutput, IdeaOutput
 from alpha_lab.backtest.engine import BacktestDataError, run_backtest
@@ -44,7 +52,7 @@ from alpha_lab.checks.static import static_check
 from alpha_lab.config import Settings
 from alpha_lab.events.bus import EventBus, PipelineEvent
 from alpha_lab.ledger.db import Ledger, strict_json
-from alpha_lab.pipeline.validation import validate_signal
+from alpha_lab.pipeline.validation import run_signal, validate_signal
 
 IDEA_RETRIES_ON_DUPLICATE = 2
 # No revision after these: the critic gave no usable review, so there is no feedback to send the coder.
@@ -95,6 +103,11 @@ class _PipelineProgress:
     idea: IdeaOutput | None = None
     attempts: int = 0
 
+    def end(self, status: str, error: str | None) -> None:
+        """Set the status for an early stop. Every exit path in run_single_pipeline goes through here,
+        so the status cannot be left as the verdict of an earlier attempt."""
+        self.status, self.error = status, error
+
 
 @dataclass
 class _AttemptChecks:
@@ -134,6 +147,21 @@ def _emit(
     )
 
 
+def relevant_ideas(ledger: Ledger, theme: str, limit: int = AVOID_LIST_SIZE) -> list:
+    """The earlier ideas the ideas prompt shows, newest first. Ideas from the same theme come first, so
+    the model sees the family it is asked to stay in, even when those ideas are old. The rest fill up
+    with the newest ideas. Dedup still compares every idea, so this only changes what the model is
+    told (R3-WHOLE-09)."""
+    rows = list(reversed(ledger.all_ideas()))  # newest first
+    same_theme = [row["idea_id"] for row in rows if row["theme"] == theme][: limit // 2]
+    chosen = set(same_theme)
+    for row in rows:
+        if len(chosen) >= limit:
+            break
+        chosen.add(row["idea_id"])
+    return [row for row in rows if row["idea_id"] in chosen][:limit]
+
+
 async def _draft_unique_idea(
     ctx: PipelineContext, pipeline_id: str, theme: str
 ) -> tuple[IdeaOutput, str]:
@@ -148,13 +176,17 @@ async def _draft_unique_idea(
     threshold = settings.dedup.similarity_threshold
     async with ctx.idea_lock:
         for _ in range(IDEA_RETRIES_ON_DUPLICATE + 1):
+            # The id is chosen before the call, so the ideas call's llm_calls row names the idea it
+            # produced (WHOLE-07). A rejected draft's id is never stored as an idea.
+            candidate_id = uuid.uuid4().hex
             idea = await generate_idea(
                 ctx.llm,
                 prompt=ctx.idea_prompt,
                 model=settings.agents.ideas_model,
-                recent_ideas=list(ctx.ledger.recent_ideas(30)),
+                recent_ideas=relevant_ideas(ctx.ledger, theme),
                 theme=theme,
                 pipeline_id=pipeline_id,
+                idea_id=candidate_id,
             )
             best_score, best_id = 0.0, None
             for old in ctx.ledger.all_ideas():
@@ -164,7 +196,7 @@ async def _draft_unique_idea(
                 if score > best_score:
                     best_score, best_id = score, old["idea_id"]
             if best_score < threshold:
-                idea_id = uuid.uuid4().hex
+                idea_id = candidate_id
                 ctx.ledger.add_idea(
                     idea_id=idea_id,
                     run_id=ctx.run_id,
@@ -198,10 +230,12 @@ async def _draft_unique_idea(
 
 
 async def run_single_pipeline(ctx: PipelineContext, theme: str) -> PipelineResult:
-    """Run one pipeline to a terminal status and always emit its pipeline_finished event.
+    """Run one pipeline to a terminal status and emit its pipeline_finished event in a finally.
 
-    Only BudgetExceeded and the fatal API errors are raised, because they end the whole run. Every
-    other failure becomes this pipeline's status, and the run goes on.
+    BudgetExceeded and the fatal API errors are raised, because they end the whole run. So are
+    cancellation and the other BaseException exits, after their status is recorded. Every other
+    failure becomes this pipeline's status, and the run goes on. A cancellation is recorded as
+    aborted_cancelled, whichever stage it reached, and then re-raised.
     """
     pipeline_id = uuid.uuid4().hex
     _emit(ctx, "pipeline_started", "pipeline", pipeline_id, None, None, None, {"theme": theme})
@@ -209,15 +243,22 @@ async def run_single_pipeline(ctx: PipelineContext, theme: str) -> PipelineResul
     try:
         await _run_stages(ctx, pipeline_id, theme, progress)
     except BudgetExceeded as exc:
-        progress.status, progress.error = "aborted_budget", str(exc)
+        progress.end("aborted_budget", str(exc))
         raise
     except FATAL_API_ERRORS as exc:
-        progress.status, progress.error = "aborted_error", f"{type(exc).__name__}: {exc}"
+        progress.end("aborted_error", f"{type(exc).__name__}: {exc}")
+        raise
+    except asyncio.CancelledError:
+        # A sibling's fatal error, Ctrl+C or shutdown. The stage it was in does not matter.
+        progress.end("aborted_cancelled", "cancelled")
         raise
     except anthropic.APIError as exc:
-        progress.status, progress.error = "failed_api", f"{type(exc).__name__}: {exc}"
+        progress.end("failed_api", f"{type(exc).__name__}: {exc}")
     except Exception as exc:  # noqa: BLE001 - one pipeline's failure must not end the run
-        progress.status, progress.error = "failed_error", f"{type(exc).__name__}: {exc}"
+        progress.end("failed_error", f"{type(exc).__name__}: {exc}")
+    except BaseException as exc:  # KeyboardInterrupt and other exits: record, then let them go on
+        progress.end("aborted_error", f"{type(exc).__name__}: {exc}")
+        raise
     finally:
         _emit(
             ctx,
@@ -350,14 +391,23 @@ async def _validate(
         )
     except BaseException as exc:
         # The attempt passed the critic, but validation did not finish. It must not stay critic_pass.
-        ctx.ledger.update_attempt(
-            attempt_id, status="aborted_error", error=f"{type(exc).__name__}: {exc}"
-        )
+        # A failed write here must not replace the exception, so it is reported and the original is raised.
+        try:
+            if isinstance(exc, asyncio.CancelledError):
+                ctx.ledger.update_attempt(attempt_id, status="aborted_cancelled", error="cancelled")
+            else:
+                ctx.ledger.update_attempt(
+                    attempt_id, status="aborted_error", error=f"{type(exc).__name__}: {exc}"
+                )
+        except Exception as write_exc:  # noqa: BLE001 - the original exception matters more
+            print(f"[single] could not record attempt {attempt_id}: {write_exc}", file=sys.stderr)
         raise
-    if verdict.data_error:
-        # The validation window could not be scored, so there is no pass or fail to record.
-        ctx.ledger.update_attempt(attempt_id, status="failed_backtest", error=verdict.error)
-        progress.status, progress.error = "failed_backtest", verdict.error
+    if verdict.no_verdict_status is not None:
+        # The validation window gave no verdict: it could not be scored, the sandbox did not finish, or
+        # the Sharpe is not a number. Nothing is recorded as a pass or a fail, so the attempt does not
+        # count as having passed the critic's gate (R4-WHOLE-03, R4-AGT-08).
+        ctx.ledger.update_attempt(attempt_id, status=verdict.no_verdict_status, error=verdict.error)
+        progress.status, progress.error = verdict.no_verdict_status, verdict.error
         return
     status = "validation_pass" if verdict.passed else "validation_fail"
     with ctx.ledger.transaction():
@@ -421,7 +471,10 @@ async def _check_attempt(
     except BudgetExceeded as exc:
         _abort(ctx, attempt_id, "aborted_budget", str(exc), checks)
         raise
-    except BaseException as exc:  # includes cancellation: no attempt stays 'running'
+    except asyncio.CancelledError:
+        _abort(ctx, attempt_id, "aborted_cancelled", "cancelled", checks)
+        raise
+    except BaseException as exc:  # no attempt stays 'running'
         _abort(ctx, attempt_id, "aborted_error", f"{type(exc).__name__}: {exc}", checks)
         raise
 
@@ -476,7 +529,9 @@ async def _run_checks(
 
     sandboxed = SandboxedSignal(code.code, settings.sandbox.timeout_seconds, allowed)
     ctx.ledger.add_trial(uuid.uuid4().hex, ctx.run_id, attempt_id, digest)
-    outcome: SandboxOutcome = await asyncio.to_thread(sandboxed.run, ctx.train_prices)
+    outcome: SandboxOutcome = await asyncio.to_thread(run_signal, sandboxed, ctx.train_prices)
+    # Which containment mechanism ran (job-object, process-group or taskkill), kept for the audit.
+    ctx.ledger.update_attempt(attempt_id, containment=outcome.containment)
     emit(
         "sandbox_run",
         "sandbox",
@@ -695,7 +750,11 @@ def _abort(
     error: str,
     checks: _AttemptChecks,
 ) -> None:
-    """Record what an attempt reached before an exception stopped it, so no row stays 'running'."""
+    """Record what an attempt reached before an exception stopped it, so no row stays 'running'.
+
+    A failed write here is reported and not raised. The exception that stopped the attempt is the one
+    the caller must see. execute_run closes any attempt still left open when the run ends (R4-AGT-02).
+    """
     fields: dict[str, Any] = {"status": status, "error": error}
     if checks.static_ok is not None:
         fields["static_ok"] = int(checks.static_ok)
@@ -705,7 +764,10 @@ def _abort(
         fields["lookahead_ok"] = int(checks.lookahead_ok)
     if checks.metrics is not None:
         fields["train_metrics_json"] = strict_json(checks.metrics)
-    ctx.ledger.update_attempt(attempt_id, **fields)
+    try:
+        ctx.ledger.update_attempt(attempt_id, **fields)
+    except Exception as exc:  # noqa: BLE001 - the original exception matters more than this write
+        print(f"[single] could not record attempt {attempt_id} as {status}: {exc}", file=sys.stderr)
 
 
 def _flag(value: bool | None) -> int | None:

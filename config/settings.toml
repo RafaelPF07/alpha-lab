@@ -8,7 +8,7 @@ holdout_end = "2025-12-31"
 
 [data]
 ffill_limit_days = 3              # forward-fill gaps of up to this many trading days (rows of the price index)
-max_missing_fraction = 0.02       # drop a ticker if more of its rows are missing
+max_missing_fraction = 0.02       # drop a ticker if more of its training-window rows (start to train_end) are missing
 flag_return_large = 0.15          # flag (never delete) daily moves beyond this
 flag_return_extreme = 0.50        # ...and mark these as extreme
 
@@ -29,7 +29,7 @@ coder_model = "claude-haiku-5-5"
 critic_model = "claude-sonnet-5-5"
 max_revisions = 3
 max_tokens_per_call = 4000
-context_limit_tokens = 90000      # stay under Haiku 5.5's 100K pricing threshold
+context_limit_tokens = 90000      # target for the estimated prompt size, 3.5 characters per token (llm.py); Haiku 5.5 prices above 100K
 
 [run]
 default_budget_usd = 2.0
@@ -69,8 +69,12 @@ output = 0.50
 input_over_100k = 0.50            # prompts above 100K tokens
 output_over_100k = 2.50
 cache_read = 0.01
+cache_write_5m = 0.125
+cache_write_5m_over_100k = 0.625
+cache_read_over_100k = 0.05
 
 [pricing.models.claude-sonnet-5-5]
 input = 2.00
 output = 10.00
 cache_read = 0.10
+cache_write_5m = 2.50

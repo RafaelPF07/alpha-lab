@@ -28,6 +28,7 @@ async def generate_idea(
     recent_ideas: list,
     theme: str,
     pipeline_id: str,
+    idea_id: str | None = None,
 ) -> IdeaOutput:
     user_text = (
         f"{format_avoid_list(recent_ideas[:AVOID_LIST_SIZE])}\n\n"
@@ -43,6 +44,7 @@ async def generate_idea(
         tool_name=TOOL_NAME,
         tool_description=TOOL_DESCRIPTION,
         pipeline_id=pipeline_id,
+        idea_id=idea_id,
     )
     assert isinstance(result, IdeaOutput)
     return result

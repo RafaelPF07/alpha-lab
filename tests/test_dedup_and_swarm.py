@@ -2,7 +2,7 @@ import asyncio
 
 import numpy as np
 import pandas as pd
-from fakes import RoutingAnthropic, tool_response
+from fakes import RoutingAnthropic, tool_response, with_test_cache_prices
 
 from alpha_lab.checks.dedup import idea_similarity, normalised_code_hash
 from alpha_lab.checks.sandbox import SandboxFailure, SandboxOutcome
@@ -67,7 +67,7 @@ def idea_for(n: int) -> dict:
 
 
 def relaxed_settings(concurrency: int = 1, max_revisions: int | None = None):
-    settings = load_settings()
+    settings = with_test_cache_prices(load_settings())
     agents = settings.agents
     if max_revisions is not None:
         agents = agents.model_copy(update={"max_revisions": max_revisions})

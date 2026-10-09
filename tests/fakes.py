@@ -6,6 +6,32 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
+from alpha_lab.config import Settings
+
+
+def with_pricing(settings: Settings, model: str, **updates: Any) -> Settings:
+    """A copy of `settings` with some prices of one model changed. For tests only."""
+    models = dict(settings.pricing.models)
+    models[model] = models[model].model_copy(update=updates)
+    pricing = settings.pricing.model_copy(update={"models": models})
+    return settings.model_copy(update={"pricing": pricing})
+
+
+def with_test_cache_prices(settings: Settings) -> Settings:
+    """The shipped settings with the cache prices filled in as TEST VALUES, so the test models are
+    runnable. These are not Anthropic's prices. A test that checks a price sets its own value."""
+    for model, price in settings.pricing.models.items():
+        updates: dict[str, float] = {}
+        if price.cache_write_5m is None:
+            updates["cache_write_5m"] = 2.0 * price.input
+        if price.input_over_100k is not None and price.cache_write_5m_over_100k is None:
+            updates["cache_write_5m_over_100k"] = 2.0 * (price.cache_write_5m or price.input)
+        if price.input_over_100k is not None and price.cache_read_over_100k is None:
+            updates["cache_read_over_100k"] = 2.0 * price.cache_read
+        if updates:
+            settings = with_pricing(settings, model, **updates)
+    return settings
+
 
 def tool_response(
     name: str,

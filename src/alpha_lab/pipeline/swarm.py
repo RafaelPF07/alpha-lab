@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 
 from alpha_lab.agents.budget import Budget, BudgetExceeded
 from alpha_lab.pipeline.single import PipelineContext, PipelineResult, run_single_pipeline
+from alpha_lab.statuses import PASSED_CRITIC, PASSED_VALIDATION
 
 
 @dataclass
@@ -20,7 +21,8 @@ class SwarmProgress:
     started_at: float = field(default_factory=time.monotonic)
     running: int = 0
     done: int = 0
-    passed: int = 0
+    passed_critic: int = 0
+    passed_validation: int = 0
     statuses: Counter = field(default_factory=Counter)
 
     @property
@@ -73,8 +75,10 @@ async def run_swarm(
             results.append(result)
             progress.done += 1
             progress.statuses[result.status] += 1
-            if result.status in ("critic_pass", "validation_pass"):
-                progress.passed += 1
+            if result.status in PASSED_CRITIC:
+                progress.passed_critic += 1
+            if result.status in PASSED_VALIDATION:
+                progress.passed_validation += 1
             if on_progress:
                 on_progress(progress)
 

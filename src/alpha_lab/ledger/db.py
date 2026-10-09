@@ -9,7 +9,10 @@ from __future__ import annotations
 import json
 import math
 import numbers
+import re
 import sqlite3
+import sys
+import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -17,12 +20,20 @@ from pathlib import Path
 from typing import Any
 
 from alpha_lab.config import PROJECT_ROOT
+from alpha_lab.statuses import HOLDOUT_STATUSES, LLM_CALL_STATUSES
 
 LEDGER_PATH = PROJECT_ROOT / "runs" / "ledger.db"
 
 
 class HoldoutConflict(RuntimeError):
     """A holdout row for this idea or this attempt already exists. Raised by claim_holdouts."""
+
+
+def _check_holdout_status(status: str) -> None:
+    """Holdout rows take only the statuses in alpha_lab.statuses (DECISION-13, R4-WHOLE-05)."""
+    if status not in HOLDOUT_STATUSES:
+        raise ValueError(f"holdout status {status!r} is not one of {sorted(HOLDOUT_STATUSES)}")
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -83,7 +94,8 @@ CREATE TABLE IF NOT EXISTS trials (
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS events (
-    event_id TEXT PRIMARY KEY,
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
     run_id TEXT NOT NULL REFERENCES runs(run_id),
     pipeline_id TEXT,
     idea_id TEXT,
@@ -128,6 +140,12 @@ CREATE TRIGGER IF NOT EXISTS trials_no_update BEFORE UPDATE ON trials
 BEGIN
     SELECT RAISE(ABORT, 'trials are append-only: the deflated Sharpe counts them');
 END;
+-- INSERT OR REPLACE skips the delete trigger unless recursive_triggers is on, so inserts are guarded.
+CREATE TRIGGER IF NOT EXISTS trials_no_replace BEFORE INSERT ON trials
+WHEN EXISTS (SELECT 1 FROM trials WHERE trial_id = NEW.trial_id)
+BEGIN
+    SELECT RAISE(ABORT, 'trials are append-only: the deflated Sharpe counts them');
+END;
 """
 
 # Columns added after the first schema. Applied to existing ledgers without losing rows.
@@ -138,11 +156,21 @@ MIGRATIONS = {
         "critic_json": "TEXT",
         "suspicion_level": "TEXT",
         "train_returns_json": "TEXT",
+        "containment": "TEXT",  # the sandbox containment that ran: job-object, process-group, taskkill
     },
     "validations": {"returns_json": "TEXT"},
+    # The SHA-256 of the prompt text that produced the call (WHOLE-15).
+    "llm_calls": {"prompt_sha256": "TEXT"},
     # Holdout key and audit fields. idea_id gets its unique index in ensure_holdout_key().
     "holdout_runs": {"idea_id": "TEXT", "data_sha256": "TEXT", "invocation_json": "TEXT"},
 }
+
+# The events table definition, taken from SCHEMA so the rebuild uses the same columns.
+_EVENTS_DDL = re.search(r"CREATE TABLE IF NOT EXISTS events \(.*?\n\);", SCHEMA, re.S).group(0)
+
+# Ledgers written before the seq key have events keyed by a text id and paged by rowid. VACUUM may
+# renumber rowids, so such a table is rebuilt once, with the same rows in the same order (BE-07).
+_EVENTS_TABLE_OLD_NAME = "events_before_seq"
 
 # Lookups by run and by code hash. Created after the migrations, so older ledgers get them too.
 INDEXES = (
@@ -155,6 +183,8 @@ INDEXES = (
     "CREATE INDEX IF NOT EXISTS rejected_ideas_run ON rejected_ideas(run_id)",
     "CREATE INDEX IF NOT EXISTS validations_run ON validations(run_id)",
     "CREATE INDEX IF NOT EXISTS holdout_runs_run ON holdout_runs(run_id)",
+    "CREATE INDEX IF NOT EXISTS attempts_idea ON attempts(idea_id)",
+    "CREATE INDEX IF NOT EXISTS llm_calls_idea ON llm_calls(idea_id)",
 )
 
 
@@ -189,15 +219,19 @@ def strict_json(value: Any) -> str:
 
 class Ledger:
     def __init__(self, path: Path = LEDGER_PATH, *, read_only: bool = False) -> None:
-        """Open the ledger. With read_only=True the file is opened with SQLite's mode=ro: it is never
-        created, and no schema, migration or index statement runs, so a read cannot change the file."""
+        """Open the ledger. With read_only=True the file must already exist and is never created, and
+        no schema, migration or index statement runs. The connection is read-write with
+        PRAGMA query_only = ON: application writes are refused, and SQLite can still roll back a
+        crashed writer's hot journal, which a mode=ro connection cannot do (R3-BE-01)."""
         self.path = path
         self.read_only = read_only
         self._tx_depth = 0
         self._known_columns: dict[str, set[str]] = {}
+        self._warned_duplicate_holdouts = False
         if read_only:
-            self.conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+            self.conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=rw", uri=True)
             self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA query_only = ON")
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
@@ -211,7 +245,27 @@ class Ledger:
     def close(self) -> None:
         self.conn.close()
 
+    def _rebuild_events_with_seq(self) -> None:
+        """Rebuild an events table that has no seq key. The rows keep their order (BE-07)."""
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(events)")}
+        if "seq" in columns:
+            return
+        new_table = _EVENTS_DDL.replace("CREATE TABLE IF NOT EXISTS events", "CREATE TABLE events")
+        self.conn.executescript(
+            f"""BEGIN;
+            ALTER TABLE events RENAME TO {_EVENTS_TABLE_OLD_NAME};
+            {new_table};
+            INSERT INTO events (event_id, run_id, pipeline_id, idea_id, attempt_number, agent,
+                                stage, type, timestamp, payload_json)
+              SELECT event_id, run_id, pipeline_id, idea_id, attempt_number, agent,
+                     stage, type, timestamp, payload_json
+              FROM {_EVENTS_TABLE_OLD_NAME} ORDER BY timestamp, rowid;
+            DROP TABLE {_EVENTS_TABLE_OLD_NAME};
+            COMMIT;"""
+        )
+
     def _migrate(self) -> None:
+        self._rebuild_events_with_seq()
         for table, columns in MIGRATIONS.items():
             existing = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
             for column, col_type in columns.items():
@@ -291,11 +345,35 @@ class Ledger:
     def get_run(self, run_id: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
 
+    def effective_run_status(
+        self, run_id: str, stale_after: timedelta, now: datetime | None = None
+    ) -> str | None:
+        """The status a reader should show for a run. Reads only, so it works on a read-only ledger.
+
+        A run still marked 'running' whose newest event is older than `stale_after` is reported as
+        'abandoned': its process has died, and the reaper has not run yet (R3-WHOLE-02). Returns None
+        for an unknown run.
+        """
+        run = self.get_run(run_id)
+        if run is None:
+            return None
+        if run["status"] != "running":
+            return run["status"]
+        newest = self.conn.execute(
+            "SELECT MAX(timestamp) FROM events WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        last_seen = datetime.fromisoformat(newest or run["started_at"])
+        cutoff = (now or datetime.now(UTC)) - stale_after
+        return "running" if last_seen >= cutoff else "abandoned"
+
     def abandon_stale_runs(self, stale_after: timedelta) -> list[str]:
         """Mark 'running' runs 'abandoned' when their newest event is older than `stale_after`.
 
-        A live run writes events all the time, so a run that has been silent this long belongs
-        to a process that died. Its attempts still marked 'running' become 'abandoned' too.
+        A live run writes events all the time, so a run that has been silent this long belongs to a
+        process that died. Its attempts still marked 'running' become 'abandoned'. Each pipeline it
+        left open (pipeline_started with no pipeline_finished) gets a pipeline_finished event with
+        status aborted_error. The caller (run.execute_run) writes run_finished. Its total_cost_usd is the sum of its
+        llm_calls rows, as for a live run (DECISION-5).
         """
         cutoff = (datetime.now(UTC) - stale_after).isoformat(timespec="milliseconds")
         rows = self.conn.execute(
@@ -309,15 +387,54 @@ class Ledger:
         finished = now_iso()
         with self.transaction():
             for run_id in run_ids:
-                self.conn.execute(
-                    "UPDATE runs SET status = 'abandoned', finished_at = ? WHERE run_id = ?",
-                    (finished, run_id),
-                )
-                self.conn.execute(
-                    "UPDATE attempts SET status = 'abandoned' WHERE run_id = ? AND status = 'running'",
-                    (run_id,),
-                )
+                self._abandon_run(run_id, finished)
         return run_ids
+
+    def _abandon_run(self, run_id: str, finished: str) -> None:
+        """Close one dead run. Runs inside abandon_stale_runs' transaction."""
+        open_pipelines = self.conn.execute(
+            """SELECT s.pipeline_id, s.payload_json FROM events s
+               WHERE s.run_id = ? AND s.type = 'pipeline_started'
+                 AND NOT EXISTS (SELECT 1 FROM events f
+                                 WHERE f.run_id = s.run_id AND f.pipeline_id = s.pipeline_id
+                                   AND f.type = 'pipeline_finished')
+               ORDER BY s.rowid""",
+            (run_id,),
+        ).fetchall()
+        for pipeline in open_pipelines:
+            pipeline_id = pipeline["pipeline_id"]
+            attempts = self.conn.execute(
+                "SELECT COALESCE(MAX(attempt_number), 0) FROM events WHERE pipeline_id = ?",
+                (pipeline_id,),
+            ).fetchone()[0]
+            self.add_event(
+                uuid.uuid4().hex,
+                run_id,
+                pipeline_id,
+                None,
+                None,
+                None,
+                "pipeline",
+                "pipeline_finished",
+                finished,
+                {
+                    "status": "aborted_error",
+                    "attempts": attempts,
+                    "error": "the run was abandoned: its process stopped before this pipeline finished",
+                    "theme": json.loads(pipeline["payload_json"]).get("theme"),
+                },
+            )
+        self.conn.execute(
+            """UPDATE runs SET status = 'abandoned', finished_at = ?,
+                   total_cost_usd = (SELECT COALESCE(SUM(c.cost_usd), 0.0) FROM llm_calls c
+                                     WHERE c.run_id = runs.run_id)
+               WHERE run_id = ?""",
+            (finished, run_id),
+        )
+        self.conn.execute(
+            "UPDATE attempts SET status = 'abandoned' WHERE run_id = ? AND status = 'running'",
+            (run_id,),
+        )
 
     # Ideas and attempts
     def add_idea(self, **fields: Any) -> str:
@@ -347,6 +464,17 @@ class Ledger:
 
     def update_attempt(self, attempt_id: str, **fields: Any) -> None:
         self._update("attempts", "attempt_id", attempt_id, fields)
+
+    def close_running_attempts(self, run_id: str, error: str) -> int:
+        """Close this run's attempts that are still 'running' as aborted_error. The run calls it when it
+        ends, so an attempt whose own status write failed is not left open (R4-AGT-02). Returns the count."""
+        cursor = self.conn.execute(
+            "UPDATE attempts SET status = 'aborted_error', error = ? "
+            "WHERE run_id = ? AND status = 'running'",
+            (error, run_id),
+        )
+        self._commit()
+        return cursor.rowcount
 
     def attempts_for_run(self, run_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(
@@ -379,9 +507,20 @@ class Ledger:
             ).fetchone()[0]
         )
 
+    def run_cost_usd(self, run_id: str) -> float | None:
+        """The cost a reader should show for a run, or None for an unknown run. A run whose row still
+        says 'running' has no final total yet, so its cost is the sum of its llm_calls rows. That covers
+        a run whose process died before the reaper ran (R4-AGT-05). Reads only."""
+        run = self.get_run(run_id)
+        if run is None:
+            return None
+        if run["status"] == "running":
+            return self.llm_cost_total(run_id)
+        return float(run["total_cost_usd"])
+
     def llm_cost_by_agent(self, run_id: str) -> list[sqlite3.Row]:
-        """Per agent and model. Cost includes failed and cancelled calls, which were charged.
-        `calls` counts the calls that succeeded."""
+        """Per agent and model. Cost includes failed, discarded and cancelled calls, which were charged.
+        `calls` counts the calls whose reply the harness used (status 'ok'). A discarded reply is not a call."""
         return self.conn.execute(
             """SELECT agent, model,
                       SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS calls,
@@ -391,6 +530,15 @@ class Ledger:
                GROUP BY agent, model ORDER BY agent""",
             (run_id,),
         ).fetchall()
+
+    def set_llm_call_status(self, call_id: str, status: str) -> None:
+        """Change the status of one llm_calls row, for example to 'discarded' when its reply is unusable.
+        The cost stays as it was: the call was billed."""
+        if status not in LLM_CALL_STATUSES:
+            raise ValueError(
+                f"llm call status {status!r} is not one of {sorted(LLM_CALL_STATUSES)}"
+            )
+        self._update("llm_calls", "call_id", call_id, {"status": status})
 
     def add_trial(self, trial_id: str, run_id: str, attempt_id: str, code_hash: str) -> None:
         self._insert(
@@ -405,7 +553,10 @@ class Ledger:
         )
 
     def count_trials(self) -> int:
-        """Attempts that reached the sandbox. Every executed candidate counts, so the correction stays conservative."""
+        """Rows in the trials table: one per attempt that was recorded as a trial before its sandbox run
+        (single.py, _run_checks). Duplicates, static failures and rejected ideas add no row. Every
+        revision that reaches the sandbox adds one. The deflated Sharpe uses this count as its number
+        of trials. This method only counts rows. It does not show that the count is the right one."""
         return self.conn.execute("SELECT COUNT(*) FROM trials").fetchone()[0]
 
     def add_validation(
@@ -472,31 +623,63 @@ class Ledger:
 
     def events_for_run(self, run_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT * FROM events WHERE run_id = ? ORDER BY timestamp, rowid", (run_id,)
+            "SELECT * FROM events WHERE run_id = ? ORDER BY timestamp, seq", (run_id,)
         ).fetchall()
 
-    def events_after(self, rowid: int, limit: int = 500) -> list[sqlite3.Row]:
+    def events_after(self, after_seq: int, limit: int = 500) -> list[sqlite3.Row]:
+        """Events with a seq above `after_seq`, in seq order. seq is an AUTOINCREMENT key, so it is
+        stable where rowid is not (BE-07)."""
         return self.conn.execute(
-            "SELECT rowid AS seq, * FROM events WHERE rowid > ? ORDER BY rowid LIMIT ?",
-            (rowid, limit),
+            "SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?",
+            (after_seq, limit),
         ).fetchall()
 
     # Holdout runs. One row per idea, ever. Every eligible candidate is claimed in one
     # transaction before any holdout price is requested (see pipeline/holdout.py).
-    def ensure_holdout_key(self) -> None:
-        """Backfill idea_id on older holdout rows and create the one-holdout-per-idea index.
+    def ensure_holdout_key(self) -> list[sqlite3.Row]:
+        """Backfill idea_id on older holdout rows, then index it for the one-holdout-per-idea rule.
 
-        Idempotent. claim_holdouts calls it first, so the index exists before any claim.
+        Returns the ideas that already hold more than one holdout row. Ledgers written before the
+        rule existed can have them. Then the unique index cannot be created, so a non-unique index
+        is created instead, and claim_holdouts enforces the rule in code, inside BEGIN IMMEDIATE.
+        A single transaction makes the backfill and the index all-or-nothing. Idempotent.
         """
-        self.conn.execute(
-            """UPDATE holdout_runs SET idea_id = (
-                   SELECT a.idea_id FROM attempts a WHERE a.attempt_id = holdout_runs.attempt_id)
-               WHERE idea_id IS NULL"""
-        )
-        self.conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS holdout_runs_one_per_idea ON holdout_runs(idea_id)"
-        )
-        self.conn.commit()
+        with self.transaction():
+            self.conn.execute(
+                """UPDATE holdout_runs SET idea_id = (
+                       SELECT a.idea_id FROM attempts a WHERE a.attempt_id = holdout_runs.attempt_id)
+                   WHERE idea_id IS NULL"""
+            )
+            duplicates = self.holdout_duplicates()
+            if duplicates:
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS holdout_runs_by_idea ON holdout_runs(idea_id)"
+                )
+            else:
+                self.conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS holdout_runs_one_per_idea "
+                    "ON holdout_runs(idea_id)"
+                )
+        if duplicates and not self._warned_duplicate_holdouts:
+            self._warned_duplicate_holdouts = True
+            ideas = ", ".join(str(row["idea_id"]) for row in duplicates)
+            print(
+                f"[ledger] {len(duplicates)} idea(s) hold more than one holdout row ({ideas}), "
+                "written before the one-holdout-per-idea rule. The rule is enforced in code, not by "
+                "the index. To inspect them, run: SELECT h.*, a.idea_id FROM holdout_runs h JOIN "
+                "attempts a ON a.attempt_id = h.attempt_id WHERE a.idea_id IN (<the ids above>)",
+                file=sys.stderr,
+            )
+        return duplicates
+
+    def holdout_duplicates(self) -> list[sqlite3.Row]:
+        """Ideas with more than one holdout row, with the attempts that hold them. Empty when the
+        ledger follows the one-holdout-per-idea rule."""
+        return self.conn.execute(
+            """SELECT idea_id, COUNT(*) AS holdouts, GROUP_CONCAT(attempt_id, ' ') AS attempts
+               FROM holdout_runs WHERE idea_id IS NOT NULL
+               GROUP BY idea_id HAVING COUNT(*) > 1 ORDER BY idea_id"""
+        ).fetchall()
 
     def holdout_claimed(self, idea_id: str, attempt_id: str) -> bool:
         """True when this idea, or this attempt, already has a holdout row in any status."""
@@ -513,14 +696,23 @@ class Ledger:
 
         Each row needs holdout_id, attempt_id, idea_id and run_id. status (default 'running'),
         metrics and data_sha256 are optional. invocation (argv, user, time) is stored as JSON.
+
+        This takes the write lock itself (BEGIN IMMEDIATE), so it must not run inside transaction():
+        there it would commit the caller's pending writes (R4-AGT-14). It is refused there.
         """
+        if self._tx_depth:
+            raise RuntimeError(
+                "claim_holdouts takes the write lock itself, so it cannot run inside transaction()"
+            )
+        for row in rows:
+            _check_holdout_status(row.get("status", "running"))
         self.ensure_holdout_key()
         if self.conn.in_transaction:
             self.conn.commit()
         invocation_json = None if invocation is None else strict_json(invocation)
         created_at = now_iso()
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
+        with self.transaction():  # commits on success, rolls back on any exception
+            self.conn.execute("BEGIN IMMEDIATE")
             for row in rows:
                 if self.holdout_claimed(row["idea_id"], row["attempt_id"]):
                     raise HoldoutConflict(
@@ -544,10 +736,6 @@ class Ledger:
                         invocation_json,
                     ),
                 )
-            self.conn.commit()
-        except BaseException:
-            self.conn.rollback()
-            raise
 
     def add_holdout(
         self,
@@ -585,19 +773,25 @@ class Ledger:
         metrics: dict | None,
         data_sha256: str | None = None,
     ) -> None:
-        """Record the outcome. A hash already stored is kept if None is passed."""
-        self.conn.execute(
-            """UPDATE holdout_runs
-               SET status = ?, metrics_json = ?, data_sha256 = COALESCE(?, data_sha256)
-               WHERE attempt_id = ?""",
-            (
-                status,
-                None if metrics is None else strict_json(metrics),
-                data_sha256,
-                attempt_id,
-            ),
-        )
-        self.conn.commit()
+        """Record the outcome. A hash already stored is kept if None is passed. Raises when no holdout
+        row exists for the attempt, so a lost outcome is never reported as saved (R3-AGT-15).
+        Uses transaction(), so inside an outer transaction the caller's writes are not rolled back by a
+        failure here (R4-AGT-14)."""
+        _check_holdout_status(status)
+        with self.transaction():
+            cursor = self.conn.execute(
+                """UPDATE holdout_runs
+                   SET status = ?, metrics_json = ?, data_sha256 = COALESCE(?, data_sha256)
+                   WHERE attempt_id = ?""",
+                (
+                    status,
+                    None if metrics is None else strict_json(metrics),
+                    data_sha256,
+                    attempt_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"no holdout row for attempt {attempt_id!r}; nothing was recorded")
 
     def update_holdout(
         self,

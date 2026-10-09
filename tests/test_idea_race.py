@@ -10,7 +10,7 @@ import hashlib
 
 import numpy as np
 import pandas as pd
-from fakes import RoutingAnthropic, tool_response
+from fakes import RoutingAnthropic, tool_response, with_test_cache_prices
 
 from alpha_lab.config import GatesConfig, load_settings
 from alpha_lab.events.bus import EventBus
@@ -30,7 +30,7 @@ def idea_for(n: int) -> dict:
 
 
 def run_two_pipelines(tmp_path, client):
-    settings = load_settings()
+    settings = with_test_cache_prices(load_settings())
     settings = settings.model_copy(
         update={
             "gates": GatesConfig(

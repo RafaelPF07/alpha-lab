@@ -24,6 +24,7 @@ EventType = Literal[
     "idea_rejected_duplicate",
     "llm_call_started",
     "llm_call_refused",
+    "llm_call_retrying",
     "llm_call_finished",
     "code_written",
     "duplicate_code",
@@ -36,6 +37,7 @@ EventType = Literal[
     "validation_result",
     "pipeline_finished",
     "budget_update",
+    "budget_overrun",
     "run_finished",
 ]
 

@@ -1,10 +1,18 @@
 import asyncio
+import json
 import re
+import sqlite3
 
 import anthropic
 import httpx2 as httpx
 import pytest
-from fakes import FakeAnthropic, tool_response
+from fakes import (
+    FakeAnthropic,
+    text_response,
+    tool_response,
+    with_pricing,
+    with_test_cache_prices,
+)
 from pydantic import BaseModel, Field
 
 from alpha_lab.agents.budget import Budget, BudgetExceeded
@@ -17,11 +25,12 @@ from alpha_lab.agents.llm import (
     StepFailed,
     Usage,
     compute_cost,
+    missing_prices,
 )
 from alpha_lab.agents.models import CODER_CODE_MAX_CHARS
 from alpha_lab.agents.prompts import load_prompt
 from alpha_lab.checks.static import FORBIDDEN_BUILTINS, FORBIDDEN_IO_METHODS, FORBIDDEN_MODULE_NAMES
-from alpha_lab.config import load_settings
+from alpha_lab.config import ModelPricing, load_settings
 from alpha_lab.events.bus import EventBus
 from alpha_lab.ledger.db import Ledger
 
@@ -53,7 +62,7 @@ def bad_request():
 
 @pytest.fixture
 def settings():
-    return load_settings()
+    return with_test_cache_prices(load_settings())
 
 
 @pytest.fixture
@@ -107,6 +116,86 @@ def test_cost_formula_over_threshold_uses_long_context_prices(settings):
     pricing = settings.pricing.models["claude-haiku-5-5"]
     # 150,000 input at $0.50/M, 500 output at $2.50/M
     assert compute_cost(pricing, Usage(150_000, 500, 0, 0), 100_000) == pytest.approx(0.07625)
+
+
+# Test prices only. They are chosen so each term is easy to check by hand, not Anthropic's prices.
+def test_a_configured_cache_write_price_is_charged(settings):
+    pricing = ModelPricing(input=1.0, output=1.0, cache_read=0.1, cache_write_5m=1.25)
+    # 1,000,000 cache-write tokens at 1.25 per million
+    assert compute_cost(pricing, Usage(0, 0, 0, 1_000_000), 200_000) == pytest.approx(1.25)
+
+
+def test_long_context_cache_reads_use_their_configured_price(settings):
+    pricing = ModelPricing(
+        input=1.0,
+        output=1.0,
+        input_over_100k=2.0,
+        output_over_100k=2.0,
+        cache_read=0.1,
+        cache_read_over_100k=0.5,
+        cache_write_5m=1.25,
+    )
+    # The prompt is 150,000 tokens, over the threshold, so the over-100K cache-read price applies
+    assert compute_cost(pricing, Usage(0, 0, 150_000, 0), 100_000) == pytest.approx(0.075)
+    # Under the threshold the ordinary cache-read price applies
+    assert compute_cost(pricing, Usage(0, 0, 50_000, 0), 100_000) == pytest.approx(0.005)
+
+
+def test_long_context_cache_writes_use_their_own_price(settings):
+    pricing = settings.pricing.models["claude-haiku-5-5"]
+    # The shipped Haiku prices: 0.125 per million for 5-minute cache writes, 0.625 above 100K.
+    # A 150,000-token prompt that writes its whole cache is billed at the over-100K write price.
+    assert compute_cost(pricing, Usage(0, 0, 0, 150_000), 100_000) == pytest.approx(0.09375)
+    assert compute_cost(pricing, Usage(0, 0, 0, 50_000), 100_000) == pytest.approx(0.00625)
+
+
+def test_a_tier_without_its_long_context_write_price_is_reported_missing():
+    pricing = ModelPricing(
+        input=1.0,
+        output=1.0,
+        input_over_100k=2.0,
+        output_over_100k=2.0,
+        cache_read=0.1,
+        cache_read_over_100k=0.5,
+        cache_write_5m=1.25,
+    )
+    assert missing_prices(pricing) == ["cache_write_5m_over_100k"]
+
+
+def test_a_cache_write_without_its_price_is_refused_not_costed_at_the_input_rate():
+    pricing = ModelPricing(input=1.0, output=1.0, cache_read=0.1)
+    with pytest.raises(ValueError, match="cache_write_5m"):
+        compute_cost(pricing, Usage(0, 0, 0, 1000), 200_000)
+
+
+def test_a_model_without_a_cache_write_price_is_refused_before_anything_is_sent(settings, ledger):
+    priced_out = with_pricing(settings, "claude-haiku-5-5", cache_write_5m=None)
+
+    async def scenario():
+        llm, client = make_llm(
+            priced_out, ledger, [tool_response("submit", {"name": "abc", "count": 1})]
+        )
+        with pytest.raises(ValueError, match="cache_write_5m"):
+            await call(llm)
+        assert client.messages.calls == []
+        assert llm.budget.spent_usd == 0.0
+        assert llm.budget.reserved_usd == 0.0
+
+    asyncio.run(scenario())
+
+
+def test_the_reservation_assumes_cache_writes_at_their_price(settings, ledger):
+    # The input is about a few hundred tokens. At 10,000 per million for cache writes, the
+    # reservation is several dollars, which a 0.50 budget must refuse before anything is sent.
+    expensive = with_pricing(settings, "claude-haiku-5-5", cache_write_5m=10_000.0)
+
+    async def scenario():
+        llm, client = make_llm(expensive, ledger, [], budget_usd=0.5)
+        with pytest.raises(BudgetExceeded):
+            await call(llm)
+        assert client.messages.calls == []
+
+    asyncio.run(scenario())
 
 
 def test_budget_is_checked_before_anything_is_sent(settings, ledger):
@@ -247,9 +336,12 @@ def test_bad_requests_are_never_retried(settings, ledger):
 
 
 def test_a_failed_call_is_charged_its_reservation_and_releases_it(settings, ledger):
+    # A transport failure may have reached the server, so its reservation is charged (R4-AGT-03).
+    # A 4xx answer is charged nothing, as the tests below check.
     async def scenario():
-        llm, _ = make_llm(settings, ledger, [bad_request()])
-        with pytest.raises(anthropic.BadRequestError):
+        no_answer = anthropic.APIConnectionError(request=REQUEST)
+        llm, _ = make_llm(settings, ledger, [no_answer] * 4)
+        with pytest.raises(anthropic.APIConnectionError):
             await call(llm)
         assert llm.budget.reserved_usd == pytest.approx(0.0)
         assert llm.budget.spent_usd > 0
@@ -260,14 +352,17 @@ def test_a_failed_call_is_charged_its_reservation_and_releases_it(settings, ledg
 
 
 def test_a_cancelled_call_is_recorded_as_cancelled(settings, ledger):
-    class HangingMessages:
-        async def create(self, **kwargs):
-            await asyncio.Event().wait()
-
-    class HangingClient:
-        messages = HangingMessages()
-
     async def scenario():
+        in_flight = asyncio.Event()
+
+        class HangingMessages:
+            async def create(self, **kwargs):
+                in_flight.set()  # the request is on the wire; nothing else is awaited
+                await asyncio.Event().wait()
+
+        class HangingClient:
+            messages = HangingMessages()
+
         llm = LLMClient(
             client=HangingClient(),
             settings=settings,
@@ -276,8 +371,11 @@ def test_a_cancelled_call_is_recorded_as_cancelled(settings, ledger):
             bus=EventBus(ledger),
             run_id="run1",
         )
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(call(llm), timeout=0.05)
+        task = asyncio.ensure_future(call(llm))
+        await in_flight.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
         assert llm.budget.reserved_usd == pytest.approx(0.0)
         assert llm.budget.spent_usd > 0
 
@@ -373,7 +471,9 @@ def test_every_call_is_logged_with_cost(settings, ledger):
 
 def test_haiku_is_sent_a_forced_tool_choice_without_parallel_tool_use(settings, ledger):
     async def scenario():
-        llm, client = make_llm(settings, ledger, [tool_response("submit", {"name": "abc", "count": 1})])
+        llm, client = make_llm(
+            settings, ledger, [tool_response("submit", {"name": "abc", "count": 1})]
+        )
         await call(llm, model="claude-haiku-5-5")
         assert client.messages.calls[0]["tool_choice"] == {
             "type": "tool",
@@ -386,7 +486,9 @@ def test_haiku_is_sent_a_forced_tool_choice_without_parallel_tool_use(settings, 
 
 def test_sonnet_is_sent_auto_tool_choice_without_parallel_tool_use(settings, ledger):
     async def scenario():
-        llm, client = make_llm(settings, ledger, [tool_response("submit", {"name": "abc", "count": 1})])
+        llm, client = make_llm(
+            settings, ledger, [tool_response("submit", {"name": "abc", "count": 1})]
+        )
         await call(llm, model="claude-sonnet-5-5")
         assert client.messages.calls[0]["tool_choice"] == {
             "type": "auto",
@@ -396,6 +498,231 @@ def test_sonnet_is_sent_auto_tool_choice_without_parallel_tool_use(settings, led
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("cls", "status"),
+    [(anthropic.AuthenticationError, 401), (anthropic.PermissionDeniedError, 403)],
+)
+def test_a_rejected_key_is_run_fatal_even_when_the_server_asks_for_a_retry(
+    settings, ledger, cls, status
+):
+    # DECISION-10: no later call can succeed with a rejected key, so the header is not honoured.
+    async def scenario():
+        sleeps = []
+        error = status_error(cls, status, headers={"x-should-retry": "true"})
+        llm, client = make_llm(settings, ledger, [error], sleeps=sleeps)
+        with pytest.raises(cls):
+            await call(llm)
+        assert len(client.messages.calls) == 1
+        assert sleeps == []
+
+    asyncio.run(scenario())
+
+
+def test_each_llm_call_row_records_the_hash_of_the_prompt_text(settings, ledger):
+    async def scenario():
+        llm, _ = make_llm(settings, ledger, [tool_response("submit", {"name": "abc", "count": 1})])
+        await call(llm)
+
+    asyncio.run(scenario())
+    [row] = ledger.conn.execute("SELECT prompt_version, prompt_sha256 FROM llm_calls").fetchall()
+    assert row["prompt_version"] == "test_v1"
+    assert row["prompt_sha256"] == PROMPT.sha256
+    edited = PromptSpec(name="test_v1", text=PROMPT.text + " One more sentence.")
+    assert edited.sha256 != PROMPT.sha256  # an edit without a rename shows
+
+
+def test_each_retry_emits_a_heartbeat_event_before_it_waits(settings, ledger):
+    def retry_events_written():
+        return [
+            json.loads(r["payload_json"])
+            for r in ledger.events_for_run("run1")
+            if r["type"] == "llm_call_retrying"
+        ]
+
+    # At each wait, record how many heartbeats are already in the ledger (R4-AGT-06).
+    waits = []
+
+    async def recording_sleep(seconds):
+        waits.append((seconds, len(retry_events_written())))
+
+    responses = [
+        rate_limit({"retry-after": "7"}),
+        rate_limit(),
+        tool_response("submit", {"name": "abc", "count": 2}),
+    ]
+    llm = LLMClient(
+        client=FakeAnthropic(responses),
+        settings=settings,
+        budget=Budget(5.0),
+        ledger=ledger,
+        bus=EventBus(ledger),
+        run_id="run1",
+        sleep=recording_sleep,
+    )
+
+    asyncio.run(call(llm))
+
+    # Each wait comes after its heartbeat: the first wait sees one event, the second sees two.
+    assert waits == [(7.0, 1), (BACKOFF_BASE_SECONDS * 2, 2)]
+    retries = retry_events_written()
+    assert [p["attempt"] for p in retries] == [1, 2]
+    assert [p["delay_seconds"] for p in retries] == [7.0, BACKOFF_BASE_SECONDS * 2]
+
+
+def test_a_call_cancelled_during_backoff_is_charged_nothing(settings, ledger):
+    # No request is in flight during the wait, so the server cannot have billed one.
+    async def cancel_during_the_wait(seconds):
+        raise asyncio.CancelledError()
+
+    async def scenario():
+        llm = LLMClient(
+            client=FakeAnthropic([rate_limit()]),
+            settings=settings,
+            budget=Budget(5.0),
+            ledger=ledger,
+            bus=EventBus(ledger),
+            run_id="run1",
+            sleep=cancel_during_the_wait,
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await call(llm)
+        assert llm.budget.reserved_usd == pytest.approx(0.0)
+        assert llm.budget.spent_usd == pytest.approx(0.0)
+
+    asyncio.run(scenario())
+    rows = ledger.conn.execute("SELECT status, cost_usd FROM llm_calls ORDER BY rowid").fetchall()
+    assert [(r["status"], r["cost_usd"]) for r in rows] == [("cancelled_before_send", 0.0)]
+
+
+def test_a_rejected_key_is_charged_nothing(settings, ledger):
+    # The server answered 401, so it did not process the request (R4-AGT-03).
+    async def scenario():
+        llm, _ = make_llm(settings, ledger, [status_error(anthropic.AuthenticationError, 401)])
+        with pytest.raises(anthropic.AuthenticationError):
+            await call(llm)
+        assert llm.budget.spent_usd == 0.0
+        assert llm.budget.reserved_usd == 0.0
+
+    asyncio.run(scenario())
+    rows = ledger.conn.execute("SELECT status, cost_usd FROM llm_calls").fetchall()
+    assert [(r["status"], r["cost_usd"]) for r in rows] == [("error", 0.0)]
+
+
+def test_a_final_rate_limit_answer_is_charged_nothing(settings, ledger):
+    async def scenario():
+        llm, _ = make_llm(settings, ledger, [rate_limit()] * 4)
+        with pytest.raises(anthropic.RateLimitError):
+            await call(llm)
+        assert llm.budget.spent_usd == 0.0
+
+    asyncio.run(scenario())
+
+
+def test_a_server_error_answer_keeps_its_reservation(settings, ledger):
+    # A 5xx may come after the server processed the request, so the reservation stays charged.
+    async def scenario():
+        llm, _ = make_llm(settings, ledger, [status_error(anthropic.InternalServerError, 500)] * 4)
+        with pytest.raises(anthropic.InternalServerError):
+            await call(llm)
+        assert llm.budget.spent_usd > 0.0
+        assert llm.budget.reserved_usd == pytest.approx(0.0)
+
+    asyncio.run(scenario())
+
+
+def test_a_refusal_that_cannot_be_recorded_still_raises_the_budget_refusal(
+    settings, ledger, monkeypatch, capsys
+):
+    def broken_write(**fields):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(ledger, "add_llm_call", broken_write)
+
+    async def scenario():
+        llm, client = make_llm(settings, ledger, [], budget_usd=0.0001)
+        with pytest.raises(BudgetExceeded):
+            await call(llm)
+        assert client.messages.calls == []
+
+    asyncio.run(scenario())
+    assert "could not record" in capsys.readouterr().err
+
+
+def test_a_truncated_reply_is_recorded_as_discarded_and_is_not_a_call(settings, ledger):
+    async def scenario():
+        reply = tool_response("submit", {"name": "abc", "count": 1}, stop_reason="max_tokens")
+        llm, _ = make_llm(settings, ledger, [reply])
+        with pytest.raises(OutputTruncated):
+            await call(llm)
+
+    asyncio.run(scenario())
+    rows = ledger.conn.execute("SELECT status, cost_usd FROM llm_calls").fetchall()
+    assert [r["status"] for r in rows] == ["discarded"]
+    assert rows[0]["cost_usd"] > 0  # the reply was billed, so it still costs
+    [agent] = ledger.llm_cost_by_agent("run1")
+    assert agent["calls"] == 0
+
+
+def test_a_reply_without_the_tool_is_discarded_and_the_repair_is_the_only_call(settings, ledger):
+    async def scenario():
+        llm, _ = make_llm(
+            settings,
+            ledger,
+            [text_response(), tool_response("submit", {"name": "abc", "count": 1})],
+        )
+        assert (await call(llm)).count == 1
+
+    asyncio.run(scenario())
+    rows = ledger.conn.execute("SELECT status FROM llm_calls ORDER BY rowid").fetchall()
+    assert [r["status"] for r in rows] == ["discarded", "ok"]
+    [agent] = ledger.llm_cost_by_agent("run1")
+    assert agent["calls"] == 1
+
+
+def test_a_failed_ledger_write_keeps_the_call_result_and_releases_the_reservation(
+    settings, ledger, capsys, monkeypatch
+):
+    def broken_write(**fields):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(ledger, "add_llm_call", broken_write)
+
+    async def scenario():
+        llm, _ = make_llm(settings, ledger, [tool_response("submit", {"name": "abc", "count": 1})])
+        result = await call(llm)
+        assert result.count == 1
+        assert llm.budget.reserved_usd == pytest.approx(0.0)
+        assert llm.budget.spent_usd > 0
+
+    asyncio.run(scenario())
+    assert "could not record" in capsys.readouterr().err
+    finished = [
+        json.loads(r["payload_json"])
+        for r in ledger.events_for_run("run1")
+        if r["type"] == "llm_call_finished"
+    ]
+    assert finished[0]["recorded"] is False
+
+
+def test_a_call_that_overshoots_the_budget_is_reported_and_the_next_is_refused(settings, ledger):
+    async def scenario():
+        llm, _ = make_llm(
+            settings,
+            ledger,
+            [tool_response("submit", {"name": "abc", "count": 1}, input_tokens=100_000)],
+            budget_usd=0.003,
+        )
+        await call(llm)  # the reservation fits; the billed usage does not
+        assert llm.budget.spent_usd > llm.budget.limit_usd
+        with pytest.raises(BudgetExceeded):
+            await call(llm)
+        assert len(llm.client.messages.calls) == 1
+
+    asyncio.run(scenario())
+    types = [row["type"] for row in ledger.events_for_run("run1")]
+    assert "budget_overrun" in types
+
+
 def test_coder_output_cap_fits_the_token_budget(settings):
     # Python is about 3 characters per token. The longest allowed program should fit in 90% of the
     # reply budget, which leaves room for the JSON wrapper.
@@ -403,7 +730,7 @@ def test_coder_output_cap_fits_the_token_budget(settings):
 
 
 def test_coder_prompt_states_every_rule_the_checker_enforces():
-    text = load_prompt("coder_v1").text
+    text = load_prompt("coder_v2").text
     for name in sorted(FORBIDDEN_BUILTINS | FORBIDDEN_MODULE_NAMES | FORBIDDEN_IO_METHODS):
         assert re.search(rf"(?<![\w.]){re.escape(name)}(?!\w)", text), f"prompt lacks {name}"
     assert "starts with `read_`" in text
