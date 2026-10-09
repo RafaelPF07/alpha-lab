@@ -1,27 +1,97 @@
 """Read-only queries behind the dashboard. Plain functions over the ledger, so they can be tested without a server.
 
-Holdout rule: a signal's holdout metrics are returned only when its holdout run is
-recorded as complete. Otherwise the holdout is reported as "locked" and no number is sent.
+Holdout rule (DECISION-1): a signal's holdout metrics are returned only when its holdout run is
+recorded as complete. Otherwise the holdout is reported as "locked" and no holdout number is sent.
+Training and validation numbers are shown on the research pages and in the signal inspector.
 """
 
 from __future__ import annotations
 
 import json
 import math
-from collections import defaultdict
+import threading
+from collections import OrderedDict, defaultdict
 from datetime import datetime
+from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-from alpha_lab.data.loader import read_pre_holdout
+from alpha_lab.config import DATA_DIR
+from alpha_lab.data.loader import PRE_HOLDOUT_FILE, read_pre_holdout
 from alpha_lab.ledger.db import Ledger
-from alpha_lab.ledger.report import build_report_data, equity_curves
+from alpha_lab.ledger.report import ReportData, build_report_data, equity_curves
 
 TRAIN_PASS = ("critic_pass", "failed_critic", "validation_pass", "validation_fail")
+TIMELINE_MARKERS = (
+    "static_check",
+    "sandbox_run",
+    "lookahead_check",
+    "train_backtest",
+    "critic_review",
+    "validation_result",
+    "revision_requested",
+    "pipeline_finished",
+    "idea_rejected_duplicate",
+    "duplicate_code",
+)
+EQUITY_MAX_POINTS = 500
+REPORT_CACHE_SIZE = 16
 
 
 def _finite(x):
     return x if isinstance(x, (int, float)) and math.isfinite(x) else None
+
+
+# The report is built from ledger-wide data (the trial count and the spread of trial Sharpes), and it
+# reads status and metric columns that are updated in place. So a cached copy is keyed by all of that.
+_report_cache: OrderedDict[tuple, ReportData] = OrderedDict()
+_report_lock = threading.Lock()
+
+
+def _report_key(ledger: Ledger, run_id: str) -> tuple | None:
+    """Cache key for a finished run. None for a run that is still running, or that does not exist."""
+    row = ledger.conn.execute("SELECT status FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    if row is None or row["status"] == "running":
+        return None
+    counts = ledger.conn.execute(
+        """SELECT (SELECT COUNT(*) FROM attempts) AS attempts,
+                  (SELECT COUNT(*) FROM attempts WHERE train_metrics_json IS NOT NULL) AS scored,
+                  (SELECT COUNT(*) FROM validations) AS validations,
+                  (SELECT COUNT(*) FROM trials) AS trials"""
+    ).fetchone()
+    return (
+        str(ledger.path),
+        run_id,
+        counts["attempts"],
+        counts["scored"],
+        counts["validations"],
+        counts["trials"],
+    )
+
+
+def report_for(ledger: Ledger, run_id: str) -> ReportData:
+    """The run's report. A finished run is served from memory until the counts above change.
+    A running run is rebuilt on every call, because its rows are still being written."""
+    key = _report_key(ledger, run_id)
+    if key is not None:
+        with _report_lock:
+            cached = _report_cache.get(key)
+            if cached is not None:
+                _report_cache.move_to_end(key)
+                return cached
+    data = build_report_data(ledger, run_id)
+    if key is not None:
+        with _report_lock:
+            _report_cache[key] = data
+            _report_cache.move_to_end(key)
+            while len(_report_cache) > REPORT_CACHE_SIZE:
+                _report_cache.popitem(last=False)
+    return data
+
+
+def _report(ledger: Ledger, run_id: str, data: ReportData | None) -> ReportData:
+    return report_for(ledger, run_id) if data is None else data
 
 
 def list_runs(ledger: Ledger) -> list[dict]:
@@ -42,30 +112,37 @@ def run_summary(ledger: Ledger, run_id: str) -> dict | None:
     run = ledger.get_run(run_id)
     if run is None:
         return None
-    ideas = ledger.ideas_for_run(run_id)
-    attempts = ledger.attempts_for_run(run_id)
-    pipelines = {
-        e["pipeline_id"]
-        for e in ledger.events_for_run(run_id)
-        if e["type"] == "pipeline_started" and e["pipeline_id"]
-    }
+    conn = ledger.conn
+    attempts = conn.execute(
+        "SELECT idea_id, status FROM attempts WHERE run_id = ?", (run_id,)
+    ).fetchall()
+    ideas = conn.execute("SELECT COUNT(*) FROM ideas WHERE run_id = ?", (run_id,)).fetchone()[0]
+    pipelines = conn.execute(
+        """SELECT COUNT(DISTINCT pipeline_id) FROM events
+           WHERE run_id = ? AND type = 'pipeline_started' AND pipeline_id IS NOT NULL
+             AND pipeline_id != ''""",
+        (run_id,),
+    ).fetchone()[0]
+    rejected = conn.execute(
+        "SELECT COUNT(*) FROM rejected_ideas WHERE run_id = ?", (run_id,)
+    ).fetchone()[0]
     return {
         "run_id": run_id,
         "status": run["status"],
         "budget_usd": run["budget_usd"],
         "spent_usd": run["total_cost_usd"],
-        "ideas": len(ideas),
-        "pipelines": len(pipelines),
+        "ideas": ideas,
+        "pipelines": pipelines,
         "train_passes": len({a["idea_id"] for a in attempts if a["status"] in TRAIN_PASS}),
         "validation_passes": len(
             {a["idea_id"] for a in attempts if a["status"] == "validation_pass"}
         ),
-        "rejected_ideas": ledger.count_rejected_ideas(),
+        "rejected_ideas": rejected,
     }
 
 
 def funnel(ledger: Ledger, run_id: str) -> list[dict]:
-    data = build_report_data(ledger, run_id)
+    data = report_for(ledger, run_id)
     return [{"stage": stage, "count": count} for stage, count in data.funnel]
 
 
@@ -102,8 +179,8 @@ def spend_by_agent(ledger: Ledger, run_id: str) -> list[dict]:
     ]
 
 
-def galaxy(ledger: Ledger, run_id: str) -> dict:
-    data = build_report_data(ledger, run_id)
+def galaxy(ledger: Ledger, run_id: str, data: ReportData | None = None) -> dict:
+    data = _report(ledger, run_id, data)
     return {
         "points": [
             {
@@ -127,16 +204,27 @@ def galaxy(ledger: Ledger, run_id: str) -> dict:
     }
 
 
-def themes(ledger: Ledger, run_id: str) -> list[dict]:
+def themes(ledger: Ledger, run_id: str, data: ReportData | None = None) -> list[dict]:
     # NaN is not valid JSON, so empty medians are sent as null.
     return [
         {k: (_finite(v) if isinstance(v, float) else v) for k, v in row.items()}
-        for row in build_report_data(ledger, run_id).themes
+        for row in _report(ledger, run_id, data).themes
     ]
 
 
-def failures(ledger: Ledger, run_id: str) -> list[dict]:
-    return [{"status": s, "count": n} for s, n in build_report_data(ledger, run_id).failures]
+def failures(ledger: Ledger, run_id: str, data: ReportData | None = None) -> list[dict]:
+    return [{"status": s, "count": n} for s, n in _report(ledger, run_id, data).failures]
+
+
+def research(ledger: Ledger, run_id: str) -> dict:
+    """Everything the research page needs. The report is built once and shared by the three parts."""
+    data = report_for(ledger, run_id)
+    return {
+        "galaxy": galaxy(ledger, run_id, data),
+        "themes": themes(ledger, run_id, data),
+        "failures": failures(ledger, run_id, data),
+        "economics": economics(ledger),
+    }
 
 
 def economics(ledger: Ledger) -> list[dict]:
@@ -169,27 +257,18 @@ def timeline(ledger: Ledger, run_id: str) -> list[dict]:
             continue
         lane = lanes[pid]
         lane["pipeline_id"] = pid
-        payload = json.loads(e["payload_json"])
-        if e["type"] == "llm_call_finished":
+        if e["type"] in ("llm_call_finished", "llm_call_refused"):
+            refused = e["type"] == "llm_call_refused"  # never sent, so there is no latency
+            payload = json.loads(e["payload_json"])
             lane["segments"].append(
                 {
                     "t": e["timestamp"],
                     "agent": e["agent"],
                     "latency_ms": payload.get("latency_ms"),
-                    "status": payload.get("status"),
+                    "status": "refused" if refused else payload.get("status"),
                 }
             )
-        elif e["type"] in (
-            "static_check",
-            "sandbox_run",
-            "lookahead_check",
-            "train_backtest",
-            "critic_review",
-            "validation_result",
-            "revision_requested",
-            "pipeline_finished",
-            "idea_rejected_duplicate",
-        ):
+        elif e["type"] in TIMELINE_MARKERS:
             lane["markers"].append(
                 {
                     "t": e["timestamp"],
@@ -261,6 +340,7 @@ def signal_detail(ledger: Ledger, attempt_id: str) -> dict | None:
             holdout_view["metrics"] = json.loads(holdout["metrics_json"])
     return {
         "attempt_id": attempt_id,
+        "run_id": row["run_id"],
         "idea": {
             "name": idea["name"],
             "hypothesis": idea["hypothesis"],
@@ -298,25 +378,46 @@ def signal_detail(ledger: Ledger, attempt_id: str) -> dict | None:
     }
 
 
-def equity(ledger: Ledger, run_id: str, top: int = 5) -> list[dict]:
-    data = build_report_data(ledger, run_id)
+def _thin(n: int, deepest: int, max_points: int) -> list[int]:
+    """Positions to keep: evenly spaced, plus both ends and the deepest drawdown, so the worst loss survives."""
+    if n <= max_points:
+        return list(range(n))
+    keep = {int(i) for i in np.linspace(0, n - 1, max_points).round()}
+    keep.update((0, n - 1, deepest))
+    return sorted(keep)
+
+
+def equity(
+    ledger: Ledger,
+    run_id: str,
+    top: int = 5,
+    max_points: int = EQUITY_MAX_POINTS,
+    data: ReportData | None = None,
+) -> list[dict]:
+    """Equity and drawdown for the top candidates by deflated Sharpe, thinned to at most max_points.
+
+    A candidate whose validation row has no returns (legacy rows) is left out. The drawdown is measured
+    from max(running peak, 1.0), the rule in backtest/metrics.py, so it agrees with the reported max drawdown.
+    """
+    data = _report(ledger, run_id, data)
     out = []
-    for c in data.candidates[:top]:
+    usable = [c for c in data.candidates if len(c.validation_returns) > 0]
+    for c in usable[:top]:
         curve = equity_curves(c)
-        running_max = curve.cummax()
-        drawdown = curve / running_max - 1.0
+        values = curve.to_numpy(dtype=float)
+        peak = np.maximum(np.maximum.accumulate(values), 1.0)
+        drawdown = values / peak - 1.0
+        keep = _thin(len(values), int(np.argmin(drawdown)), max_points)
         holdout = ledger.get_holdout(c.attempt_id)
         out.append(
             {
                 "attempt_id": c.attempt_id,
                 "name": c.name,
                 "train_end": _iso(c.train_returns.index.max()) if len(c.train_returns) else None,
-                "validation_end": _iso(c.validation_returns.index.max())
-                if len(c.validation_returns)
-                else None,
-                "dates": [_iso(d) for d in curve.index],
-                "equity": [float(v) for v in curve.values],
-                "drawdown": [float(v) for v in drawdown.values],
+                "validation_end": _iso(c.validation_returns.index.max()),
+                "dates": [_iso(curve.index[i]) for i in keep],
+                "equity": [float(values[i]) for i in keep],
+                "drawdown": [float(drawdown[i]) for i in keep],
                 "holdout": "complete"
                 if holdout is not None and holdout["status"] == "complete"
                 else "locked",
@@ -329,8 +430,8 @@ def _iso(value) -> str:
     return datetime.fromisoformat(str(value)).date().isoformat() if value is not None else None
 
 
-def correlation(ledger: Ledger, run_id: str) -> dict:
-    data = build_report_data(ledger, run_id)
+def correlation(ledger: Ledger, run_id: str, data: ReportData | None = None) -> dict:
+    data = _report(ledger, run_id, data)
     if data.correlation is None:
         return {"names": [], "matrix": [], "clusters": []}
     names = list(data.correlation.columns)
@@ -341,11 +442,32 @@ def correlation(ledger: Ledger, run_id: str) -> dict:
     }
 
 
+_price_cache: dict[Path, tuple[int, pd.DataFrame]] = {}
+
+
+def _pre_holdout_prices() -> pd.DataFrame:
+    """Pre-holdout prices, re-read only when the cache file changes. Raises FileNotFoundError if it is missing."""
+    path = DATA_DIR / PRE_HOLDOUT_FILE
+    stamp = path.stat().st_mtime_ns
+    cached = _price_cache.get(path)
+    if cached is None or cached[0] != stamp:
+        cached = (stamp, read_pre_holdout(DATA_DIR))
+        _price_cache[path] = cached
+    return cached[1]
+
+
 def equal_weight_benchmark(curves_dates: list[str]) -> dict | None:
     """Equal weight across the universe, using pre-holdout prices only, over the given dates."""
     if not curves_dates:
         return None
-    prices = read_pre_holdout()
+    try:
+        prices = _pre_holdout_prices()
+    except FileNotFoundError:
+        return {
+            "dates": [],
+            "equity": [],
+            "reason": "pre-holdout prices are not cached yet; run `lab data fetch`",
+        }
     start, end = pd.Timestamp(curves_dates[0]), pd.Timestamp(curves_dates[-1])
     window = prices.loc[start:end]
     returns = window.pct_change(fill_method=None).mean(axis=1).fillna(0.0)
