@@ -7,7 +7,7 @@ validation_end = "2021-12-31"
 holdout_end = "2025-12-31"
 
 [data]
-ffill_limit_days = 3              # forward-fill gaps up to this many days
+ffill_limit_days = 3              # forward-fill gaps of up to this many trading days (rows of the price index)
 max_missing_fraction = 0.02       # drop a ticker if more of its rows are missing
 flag_return_large = 0.15          # flag (never delete) daily moves beyond this
 flag_return_extreme = 0.50        # ...and mark these as extreme
@@ -40,7 +40,7 @@ seed = 42
 similarity_threshold = 0.85       # reject an idea whose name+description is this similar to an earlier one
 
 [diversity]
-# One theme is drawn at random for each pipeline, using a seed derived from run.seed.
+# One theme is drawn at random for each pipeline, using run.seed directly.
 themes = [
     "momentum",
     "mean reversion",
