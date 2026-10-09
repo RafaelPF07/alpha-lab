@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'">
+  <title>Alpha Lab · Live pipelines</title>
+  <link rel="stylesheet" href="/static/css/tokens.css">
+  <link rel="stylesheet" href="/static/css/live.css">
+</head>
+<body class="live">
+  <header class="live-top">
+    <div class="brand">
+      <span class="live-dot" aria-hidden="true"></span>
+      <h1>Live pipelines</h1>
+      <span id="live-state" class="pill pill-muted" role="status">waiting for events</span>
+      <span id="demo-badge" class="badge-demo" hidden>DEMO DATA</span>
+    </div>
+    <div class="top-controls">
+      <label class="sr-or-visible">run
+        <select id="run-select"></select>
+      </label>
+    </div>
+    <nav class="top-nav" aria-label="Pages">
+      <a class="active" href="/live" aria-current="page">live</a>
+      <a href="/">mission control</a>
+      <a href="/replay">replay</a>
+      <a href="/research">research</a>
+    </nav>
+  </header>
+
+  <section class="stats" aria-label="Run totals">
+    <div class="stat"><span class="stat-value" id="stat-running">0</span><span class="stat-label">running</span></div>
+    <div class="stat"><span class="stat-value" id="stat-done">0</span><span class="stat-label">finished</span></div>
+    <div class="stat stat-ok"><span class="stat-value" id="stat-passed">0</span><span class="stat-label">passed the gate</span></div>
+    <div class="stat stat-warn"><span class="stat-value" id="stat-dupes">0</span><span class="stat-label">duplicates caught</span></div>
+    <div class="stat stat-budget"><span class="stat-value" id="stat-spent">$0.0000</span><span class="stat-label" id="stat-budget">of budget</span></div>
+    <div class="progress" aria-hidden="true"><div class="progress-fill" id="progress-fill"></div></div>
+  </section>
+
+  <main class="live-main">
+    <section class="stage-wrap" aria-labelledby="stage-title">
+      <div class="stage-head">
+        <h2 id="stage-title">Pipelines in flight</h2>
+        <p class="hint">Each card is one pipeline. Packets are results moving between stations. Hover a card for details, click it to open the signal inspector. From the keyboard, use the live feed.</p>
+      </div>
+      <div class="stage" id="stage-frame">
+        <canvas id="stage" role="img" aria-label="Animated view of pipelines moving through the research stages"></canvas>
+      </div>
+      <ol class="stations" aria-label="Stations in order">
+        <li style="--c: var(--stage-idea)">idea</li>
+        <li style="--c: var(--stage-code)">code</li>
+        <li style="--c: var(--stage-static)">static</li>
+        <li style="--c: var(--stage-sandbox)">sandbox</li>
+        <li style="--c: var(--stage-lookahead)">lookahead</li>
+        <li style="--c: var(--stage-train)">train</li>
+        <li style="--c: var(--stage-critic)">critic</li>
+        <li style="--c: var(--stage-validation)">validation</li>
+      </ol>
+    </section>
+
+    <aside class="feed-wrap" aria-labelledby="feed-title">
+      <div class="feed-head">
+        <h2 id="feed-title">Live feed</h2>
+        <div class="seg" role="group" aria-label="Filter the feed">
+          <button type="button" data-filter="all" class="seg-on" aria-pressed="true">all</button>
+          <button type="button" data-filter="llm" aria-pressed="false">agents</button>
+          <button type="button" data-filter="checks" aria-pressed="false">checks</button>
+          <button type="button" data-filter="results" aria-pressed="false">results</button>
+        </div>
+      </div>
+      <!-- Not a live region: the feed updates several times a second, and announcing each update would flood a screen reader. -->
+      <ol class="feed" id="feed" role="log" aria-live="off" aria-label="Events, newest first"></ol>
+    </aside>
+  </main>
+
+  <script type="module" src="/static/js/pages/live.js"></script>
+</body>
+</html>

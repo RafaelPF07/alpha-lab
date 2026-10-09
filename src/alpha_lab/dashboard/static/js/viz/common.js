@@ -7,6 +7,7 @@ export const COLORS = {
   get muted() { return cssVar("--muted"); },
   get border() { return cssVar("--border"); },
   get panel() { return cssVar("--panel"); },
+  get panel2() { return cssVar("--panel-2"); },
   get locked() { return cssVar("--stage-holdout"); },
   stage: {
     idea: () => cssVar("--stage-idea"),
@@ -52,6 +53,19 @@ export function statusColor(status) {
 export const fmtUsd = (x) => (x == null || !Number.isFinite(x) ? "n/a" : `$${x.toFixed(4)}`);
 export const fmtPct = (x) => (x == null || !Number.isFinite(x) ? "n/a" : `${(x * 100).toFixed(2)}%`);
 export const fmtNum = (x, d = 3) => (x == null || !Number.isFinite(x) ? "n/a" : x.toFixed(d));
+
+// "1 validated signal", "3 validated signals".
+export const plural = (n, word, pluralWord = `${word}s`) => `${n} ${n === 1 ? word : pluralWord}`;
+
+// Gives a chart container a text alternative for screen readers (FE-08).
+export function describeChart(element, summary) {
+  if (!element || typeof element.setAttribute !== "function") return;
+  element.setAttribute("role", "img");
+  element.setAttribute("aria-label", summary);
+}
+
+export const prefersReducedMotion = () =>
+  typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 export const baseAxis = () => ({
   axisLine: { lineStyle: { color: COLORS.border } },

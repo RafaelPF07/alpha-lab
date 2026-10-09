@@ -1,0 +1,257 @@
+/* Live pipelines page. Builds on tokens.css. */
+
+body.live {
+  min-height: 100vh;
+  background:
+    radial-gradient(1200px 600px at 12% -10%, rgba(110, 168, 254, 0.10), transparent 60%),
+    radial-gradient(900px 500px at 100% 0%, rgba(187, 154, 247, 0.07), transparent 60%),
+    var(--bg);
+}
+
+.sr-or-visible select { margin-left: 6px; }
+
+.live-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(19, 24, 33, 0.72);
+  backdrop-filter: blur(10px);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand h1 { font-size: 16px; font-weight: 650; margin: 0; letter-spacing: 0.01em; }
+
+.live-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--status-passed);
+  box-shadow: 0 0 0 0 rgba(158, 206, 106, 0.6);
+  animation: live-pulse 1.8s infinite;
+}
+
+@keyframes live-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(158, 206, 106, 0.55); }
+  70% { box-shadow: 0 0 0 9px rgba(158, 206, 106, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(158, 206, 106, 0); }
+}
+
+.pill {
+  font-size: 11.5px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.pill-live { color: var(--ok-text); border-color: rgba(158, 206, 106, 0.4); }
+.pill-done { color: var(--accent-text); border-color: rgba(110, 168, 254, 0.4); }
+.pill-warn { color: var(--warn-text); border-color: rgba(224, 175, 104, 0.5); }
+
+.top-controls select {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+
+.top-nav { margin-left: auto; display: flex; gap: 14px; }
+.top-nav a { color: var(--muted); text-decoration: none; font-size: 13px; padding: 4px 2px; }
+.top-nav a:hover, .top-nav a.active { color: var(--text); }
+.top-nav a.active { border-bottom: 2px solid var(--accent); }
+
+/* Stats strip */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 12px;
+  padding: 16px 24px 4px;
+  position: relative;
+}
+
+.stat {
+  background: linear-gradient(180deg, rgba(26, 33, 48, 0.9), rgba(19, 24, 33, 0.9));
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.stat-value {
+  font-family: var(--font-mono);
+  font-size: 24px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  transition: color 0.3s;
+}
+.stat-label { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.06em; }
+.stat-ok .stat-value { color: var(--ok-text); }
+.stat-warn .stat-value { color: var(--warn-text); }
+.stat-budget .stat-value { color: var(--warn-text); }
+
+.progress {
+  grid-column: 1 / -1;
+  height: 4px;
+  border-radius: 4px;
+  background: rgba(122, 162, 247, 0.12);
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--stage-idea), var(--stage-validation));
+  transition: width 0.5s ease;
+}
+
+/* Main layout */
+.live-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 16px;
+  padding: 16px 24px 28px;
+}
+
+.stage-wrap { min-width: 0; }
+.stage-head h2, .feed-head h2 {
+  font-size: 12.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin: 0 0 4px;
+}
+.hint { color: var(--muted); font-size: 12.5px; margin: 0 0 10px; max-width: 70ch; }
+
+.stage {
+  position: relative;
+  height: min(74vh, 780px);
+  min-height: 480px;
+  border-radius: 18px;
+  overflow: hidden;
+  border: 1px solid rgba(122, 162, 247, 0.18);
+  background: #070a12;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4), 0 24px 60px rgba(0, 0, 0, 0.45), inset 0 0 80px rgba(110, 168, 254, 0.05);
+}
+.stage canvas { display: block; }
+
+.stations {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.stations li {
+  font-size: 11.5px;
+  color: var(--text);
+  border: 1px solid color-mix(in srgb, var(--c) 40%, transparent);
+  background: color-mix(in srgb, var(--c) 10%, transparent);
+  padding: 3px 10px 3px 8px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+/* The colour is carried by a dot, so the station name keeps full text contrast in both themes. */
+.stations li::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--c);
+}
+
+/* Feed */
+.feed-wrap {
+  min-width: 0;
+  background: rgba(19, 24, 33, 0.7);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  height: min(74vh, 780px);
+  min-height: 480px;
+}
+.feed-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.seg button {
+  background: transparent;
+  color: var(--muted);
+  border: 0;
+  padding: 4px 9px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.seg button.seg-on { background: var(--panel-2); color: var(--text); }
+.seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.feed {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.feed li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  align-items: baseline;
+  padding: 7px 4px;
+  border-bottom: 1px solid rgba(36, 44, 61, 0.7);
+  animation: feed-in 0.35s ease-out;
+}
+.feed li time { color: var(--muted); font-variant-numeric: tabular-nums; }
+.feed .chip {
+  font-size: 10.5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  color: #0b0e14;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.feed .who { color: var(--muted); }
+.feed .txt { color: var(--text); flex: 1 1 100%; line-height: 1.4; overflow-wrap: anywhere; }
+.feed li > a { flex: 1 1 100%; min-width: 0; }
+.feed a { color: inherit; text-decoration: none; }
+.feed a:hover .txt { text-decoration: underline; }
+
+@keyframes feed-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Small screens: the feed moves under the stage and the stage keeps its height. */
+@media (max-width: 1000px) {
+  .live-main { grid-template-columns: 1fr; padding: 12px 14px 24px; }
+  .feed-wrap { height: 380px; min-height: 0; }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 12px 14px 4px; }
+  .stats .stat-budget { grid-column: 1 / -1; }
+  .live-top { padding: 12px 14px; }
+  .top-nav { margin-left: 0; }
+  .stage { min-height: 420px; height: 70vh; }
+}
+
+/* Reduced motion: the pulse, the feed entrance and the bar animation stop. Every state change still shows. */
+@media (prefers-reduced-motion: reduce) {
+  .live-dot, .feed li { animation: none; }
+  .progress-fill, .stat-value { transition: none; }
+}

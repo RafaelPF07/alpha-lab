@@ -1,17 +1,27 @@
-// Equity curves for the top signals by deflated Sharpe, shaded by period. The holdout stays grey and
-// labelled "locked" until its official run has happened. Dashed line is the equal-weight benchmark.
-import { COLORS, baseAxis, baseText, track } from "./common.js";
+// Equity curves for the top signals by deflated Sharpe, shaded by period. The holdout is shaded only
+// when the payload gives its dates (holdout_start and holdout_end). Dashed line is the equal-weight benchmark.
+import { COLORS, baseAxis, baseText, describeChart, plural, track } from "./common.js";
 
 let chart = null;
+let container = null;
 const PALETTE = ["#7aa2f7", "#9ece6a", "#ff9e64", "#bb9af7", "#7dcfff"];
 
-export function init(container) {
-  chart = track(echarts.init(container, null, { renderer: "canvas" }));
+export function init(el) {
+  container = el;
+  chart = track(echarts.init(el, null, { renderer: "canvas" }));
   return chart;
 }
 
 export function update(curves, benchmark = null) {
-  if (!chart || !curves.length) return;
+  if (!chart) return;
+  if (!curves || !curves.length) {
+    // Clear the previous run's curves, so the chart and the run note never disagree (FE-03).
+    describeChart(container, "Equity curves: no validated signals in this run.");
+    chart.clear();
+    chart.setOption({ ...baseText(), title: { text: "no validated signals in this run", left: "center", top: "middle",
+      textStyle: { color: COLORS.muted, fontSize: 13 } } });
+    return;
+  }
   const first = curves[0];
   const trainEnd = first.train_end;
   const valEnd = first.validation_end;
@@ -31,15 +41,21 @@ export function update(curves, benchmark = null) {
   if (trainEnd) areas.push([{ xAxis: first.dates[0], name: "train", itemStyle: { color: "rgba(122,162,247,0.06)" } }, { xAxis: trainEnd }]);
   if (valEnd && trainEnd) areas.push([{ xAxis: trainEnd, name: "validation", itemStyle: { color: "rgba(158,206,106,0.07)" } }, { xAxis: valEnd }]);
   const holdoutLocked = curves.some((c) => c.holdout !== "complete");
-  if (holdoutLocked && valEnd) {
-    const last = first.dates[first.dates.length - 1];
-    areas.push([{ xAxis: valEnd, name: "holdout: locked", itemStyle: { color: "rgba(86,95,137,0.25)" },
-      label: { color: COLORS.locked, position: "insideTop" } }, { xAxis: last }]);
+  if (holdoutLocked && first.holdout_start && first.holdout_end) {
+    areas.push([{ xAxis: first.holdout_start, name: "holdout: locked", itemStyle: { color: "rgba(86,95,137,0.25)" },
+      label: { color: COLORS.muted, position: "insideTop" } }, { xAxis: first.holdout_end }]);
   }
   series[0].markArea = { silent: true, data: areas };
+
+  const ends = curves.map((c) => {
+    const last = c.equity?.at(-1);
+    return `${c.name} ${Number.isFinite(last) ? last.toFixed(2) : "n/a"}`;
+  });
+  describeChart(container, `Equity curves for ${plural(curves.length, "validated signal")}, growth of 1.0 at the end: ${ends.join(", ")}.`);
   chart.setOption({
     ...baseText(),
-    grid: { left: 60, right: 20, top: 40, bottom: 40 },
+    // Room for a two-row legend above the plot, so the legend does not sit on the period labels.
+    grid: { left: 60, right: 20, top: 64, bottom: 40 },
     legend: { textStyle: { color: COLORS.muted }, top: 0 },
     tooltip: { trigger: "axis" },
     xAxis: { type: "time", ...baseAxis() },

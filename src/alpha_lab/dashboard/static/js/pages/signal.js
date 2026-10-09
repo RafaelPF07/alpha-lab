@@ -1,20 +1,23 @@
 // Signal inspector: one idea, its attempts, the code diff between attempts, checks, critic and holdout status.
 import { fetchJson } from "../core/api.js";
-import { COLORS, fmtNum, fmtPct, fmtUsd, statusColor } from "../viz/common.js";
+import { esc } from "../core/escape.js";
+import { signalIsDemo } from "../core/runs.js";
+import { showError, requireCharts } from "../core/page.js";
+import { COLORS, fmtNum, fmtPct, fmtUsd, statusColor, track } from "../viz/common.js";
 
 const $ = (id) => document.getElementById(id);
 const id = new URLSearchParams(location.search).get("id");
-
-function esc(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
+// The line diff table has (n+1)*(m+1) cells. Above this size the diff is skipped, to keep the page responsive.
+const MAX_DIFF_CELLS = 250000;
 
 // Line diff against the previous attempt. Added lines green, removed red. A simple LCS keeps it honest.
+// Returns null when the files are too large to compare.
 function lineDiff(a, b) {
   const x = (a || "").split("\n");
   const y = (b || "").split("\n");
   const n = x.length;
   const m = y.length;
+  if ((n + 1) * (m + 1) > MAX_DIFF_CELLS) return null;
   const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
   for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--)
     dp[i][j] = x[i] === y[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
@@ -32,13 +35,30 @@ function lineDiff(a, b) {
 }
 
 function renderCode(attempt, previous) {
-  const rows = previous ? lineDiff(previous.code, attempt.code) : attempt.code.split("\n").map((l) => ["same", l]);
+  const code = attempt.code || "";
+  let rows = code.split("\n").map((l) => ["same", l]);
+  let note = "";
+  if (previous) {
+    const diff = lineDiff(previous.code, code);
+    if (diff) rows = diff;
+    else note = " · diff skipped, the code is too large to compare";
+  }
   const html = rows.map(([kind, line]) => {
     const style = kind === "add" ? "background:rgba(158,206,106,0.18)" : kind === "del" ? "background:rgba(247,118,142,0.18)" : "";
     const sign = kind === "add" ? "+" : kind === "del" ? "-" : " ";
     return `<div style="${style}">${sign} ${esc(line)}</div>`;
   }).join("");
-  $("diff").innerHTML = `<div class="note">attempt ${attempt.attempt_number}${previous ? ` · diff against attempt ${previous.attempt_number}` : ""} · ${esc(attempt.status)}</div><pre class="code">${html}</pre>`;
+  $("diff").innerHTML = `<div class="note">attempt ${esc(attempt.attempt_number)}${previous ? ` · diff against attempt ${esc(previous.attempt_number)}` : ""} · ${esc(attempt.status)}${note}</div><pre class="code">${html}</pre>`;
+}
+
+// Shows one attempt's code, and marks its button in the list as pressed.
+function showAttempt(attempts, index) {
+  const attempt = attempts[index];
+  const previous = attempts.find((a) => a.attempt_number === attempt.attempt_number - 1);
+  renderCode(attempt, previous);
+  for (const btn of document.querySelectorAll("#attempts button")) {
+    btn.setAttribute("aria-pressed", String(Number(btn.dataset.index) === index));
+  }
 }
 
 function renderTree(attempts, onPick) {
@@ -49,7 +69,7 @@ function renderTree(attempts, onPick) {
     attempt: a,
   }));
   const root = { name: "idea", children, itemStyle: { color: COLORS.text } };
-  const chart = echarts.init($("tree"));
+  const chart = track(echarts.init($("tree")));
   chart.setOption({
     tooltip: { trigger: "item" },
     series: [{ type: "tree", data: [root], top: "8%", bottom: "8%", left: "10%", right: "20%",
@@ -59,6 +79,17 @@ function renderTree(attempts, onPick) {
   });
   chart.on("click", (p) => { if (p.data?.attempt) onPick(p.data.attempt); });
   return chart;
+}
+
+// The same attempts as a list of buttons, so the code can be opened from the keyboard (FE-08).
+function renderAttemptList(attempts, onPick) {
+  const list = $("attempts");
+  list.innerHTML = attempts.map((a, i) => `<li><button type="button" data-index="${i}" aria-pressed="false">`
+    + `#${esc(a.attempt_number)} · ${esc(a.status)}</button></li>`).join("");
+  list.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-index]");
+    if (btn) onPick(Number(btn.dataset.index));
+  });
 }
 
 function metricsTable(train, validation, holdout) {
@@ -76,10 +107,9 @@ function metricsTable(train, validation, holdout) {
     <p class="note">${holdout.status === "complete" ? "Holdout run recorded." : "Holdout not run for this signal. Its numbers stay hidden until the official holdout run."}</p>`;
 }
 
-async function init() {
-  if (!id) { $("title").textContent = "Signal inspector: no id given"; return; }
-  const data = await fetchJson(`/api/signals/${encodeURIComponent(id)}`);
-  if (data.demo || data.idea?.name) $("demo-badge").hidden = false;
+function renderSignal(data) {
+  // The demo badge comes from the run the signal belongs to, never from the idea's name (FE-06).
+  $("demo-badge").hidden = !signalIsDemo(data);
   $("title").textContent = data.idea ? data.idea.name : "Signal";
   $("idea").innerHTML = data.idea
     ? `<h2>Idea</h2><p><b>${esc(data.idea.name)}</b> · theme ${esc(data.idea.theme || "n/a")}</p>
@@ -87,13 +117,13 @@ async function init() {
     : "<p>no idea recorded</p>";
 
   const attempts = data.attempts;
-  const pick = (attempt) => {
-    const previous = attempts.find((a) => a.attempt_number === attempt.attempt_number - 1);
-    renderCode(attempt, previous);
-  };
-  renderTree(attempts, pick);
-  const latest = attempts[attempts.length - 1];
-  if (latest) pick(latest);
+  if (attempts.length) {
+    renderTree(attempts, (attempt) => showAttempt(attempts, attempts.indexOf(attempt)));
+    renderAttemptList(attempts, (index) => showAttempt(attempts, index));
+    showAttempt(attempts, attempts.length - 1);
+  } else {
+    $("diff").textContent = "No attempts recorded for this idea.";
+  }
 
   $("metrics").innerHTML = metricsTable(data.train_metrics, data.validation, data.holdout);
 
@@ -108,6 +138,17 @@ async function init() {
   const calls = data.llm_calls.map((c) => `<tr><td>${esc(c.agent)}</td><td class="mono">${esc(c.model)}</td>
     <td class="num">${c.input_tokens ?? "n/a"}</td><td class="num">${c.output_tokens ?? "n/a"}</td><td class="num">${fmtUsd(c.cost_usd)}</td></tr>`).join("");
   $("calls").innerHTML = `<table class="data"><thead><tr><th>agent</th><th>model</th><th class="num">in</th><th class="num">out</th><th class="num">cost</th></tr></thead><tbody>${calls}</tbody></table>`;
+}
+
+async function init() {
+  if (!id) { $("title").textContent = "Signal inspector: no id given"; return; }
+  try {
+    requireCharts();
+    renderSignal(await fetchJson(`/api/signals/${encodeURIComponent(id)}`));
+  } catch (err) {
+    $("title").textContent = "Signal inspector";
+    showError(`Could not load this signal. ${err.message}`);
+  }
 }
 
 init();

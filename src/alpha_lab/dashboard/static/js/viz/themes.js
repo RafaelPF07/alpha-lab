@@ -1,16 +1,19 @@
 // Theme leaderboard: per theme, how many ideas it produced, how far they got, and median Sharpe ratios.
-import { COLORS, baseAxis, baseText, track } from "./common.js";
+import { COLORS, baseAxis, baseText, describeChart, plural, track } from "./common.js";
 
 let chart = null;
+let container = null;
 
-export function init(container) {
-  chart = track(echarts.init(container, null, { renderer: "canvas" }));
+export function init(el) {
+  container = el;
+  chart = track(echarts.init(el, null, { renderer: "canvas" }));
   return chart;
 }
 
 export function update(themes) {
   if (!chart) return;
   const rows = themes.filter((t) => t.theme);
+  describeChart(container, `Theme leaderboard: ${plural(rows.length, "theme")}, median train and validation Sharpe for each.`);
   chart.setOption({
     ...baseText(),
     grid: { left: 170, right: 30, top: 40, bottom: 30 },

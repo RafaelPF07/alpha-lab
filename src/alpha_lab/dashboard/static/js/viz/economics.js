@@ -1,16 +1,19 @@
 // Model economics: cost and success rate by agent and model. Future runs with other models line up beside these.
-import { COLORS, baseAxis, baseText, track } from "./common.js";
+import { COLORS, baseAxis, baseText, describeChart, plural, track } from "./common.js";
 
 let chart = null;
+let container = null;
 
-export function init(container) {
-  chart = track(echarts.init(container, null, { renderer: "canvas" }));
+export function init(el) {
+  container = el;
+  chart = track(echarts.init(el, null, { renderer: "canvas" }));
   return chart;
 }
 
 export function update(rows) {
   if (!chart) return;
   const labels = rows.map((r) => `${r.agent} · ${r.model}`);
+  describeChart(container, `Model economics: ${plural(rows.length, "agent and model pair")}, cost and success rate for each.`);
   chart.setOption({
     ...baseText(),
     grid: { left: 60, right: 60, top: 40, bottom: 80 },

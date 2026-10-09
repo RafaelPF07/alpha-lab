@@ -1,10 +1,12 @@
 // Context-size monitor: input tokens for every LLM call over time. Shows whether prompts are creeping up.
-import { COLORS, agentColor, baseAxis, baseText, track } from "./common.js";
+import { COLORS, agentColor, baseAxis, baseText, describeChart, plural, track } from "./common.js";
 
 let chart = null;
+let container = null;
 
-export function init(container, { pricingThreshold = 100000, contextLimit = 90000 } = {}) {
-  chart = track(echarts.init(container, null, { renderer: "canvas" }));
+export function init(el, { pricingThreshold = 100000, contextLimit = 90000 } = {}) {
+  container = el;
+  chart = track(echarts.init(el, null, { renderer: "canvas" }));
   chart.__thresholds = { pricingThreshold, contextLimit };
   return chart;
 }
@@ -13,6 +15,10 @@ export function update(snapshot) {
   if (!chart) return;
   const { pricingThreshold, contextLimit } = chart.__thresholds;
   const agents = [...new Set(snapshot.context.map((c) => c.agent))];
+  let largest = 0;
+  for (const c of snapshot.context) if (c.tokens > largest) largest = c.tokens;
+  describeChart(container, `Context size: ${plural(snapshot.context.length, "LLM call")}, largest ${largest} input tokens. `
+    + `Marked: the pricing tier at ${pricingThreshold} tokens and the context limit at ${contextLimit}.`);
   const series = agents.map((agent) => ({
     name: agent,
     type: "scatter",

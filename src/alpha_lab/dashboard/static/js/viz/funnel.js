@@ -1,24 +1,28 @@
-// Live funnel: flows from ideas generated through each stage, with drop-offs branching off.
-import { COLORS, baseText, track } from "./common.js";
+// Live funnel: distinct ideas through each stage, with drop-offs branching off in red.
+import { COLORS, baseText, describeChart, track } from "./common.js";
 
+// One word per stage, so the labels do not collide on a narrow funnel. The note above the chart says what is counted.
 const STAGES = [
-  ["generated", "ideas generated", "idea"],
+  ["generated", "ideas", "idea"],
   ["coded", "coded", "code"],
-  ["static", "passed static", "static"],
-  ["sandbox", "ran in sandbox", "sandbox"],
-  ["lookahead", "passed lookahead", "lookahead"],
-  ["train", "train gate", "train"],
-  ["critic", "passed critic", "critic"],
-  ["validation", "validation pass", "validation"],
+  ["static", "static", "static"],
+  ["sandbox", "sandbox", "sandbox"],
+  ["lookahead", "lookahead", "lookahead"],
+  ["train", "train", "train"],
+  ["critic", "critic", "critic"],
+  ["validation", "validated", "validation"],
 ];
 
 let chart = null;
+let container = null;
 
-export function init(container) {
-  chart = track(echarts.init(container, null, { renderer: "canvas" }));
+export function init(el) {
+  container = el;
+  chart = track(echarts.init(el, null, { renderer: "canvas" }));
   return chart;
 }
 
+// Counts are distinct ideas. Each stage is clamped to the stage before it, so a flow never grows.
 export function buildGraph(funnel, failures) {
   const nodes = [];
   const links = [];
@@ -28,27 +32,32 @@ export function buildGraph(funnel, failures) {
   };
   const stageColor = (key) => COLORS.stage[key]?.() ?? COLORS.muted;
   const count = (k) => Number(funnel[k] ?? 0);
+  let previous = count(STAGES[0][0]);
   for (let i = 0; i < STAGES.length; i++) {
     const [key, label, color] = STAGES[i];
     addNode(label, stageColor(color));
     if (i === 0) continue;
-    const [prevKey, prevLabel] = STAGES[i - 1];
-    const reached = count(key);
-    const from = count(prevKey);
+    const [, prevLabel] = STAGES[i - 1];
+    const reached = Math.min(count(key), previous);
     if (reached > 0) links.push({ source: prevLabel, target: label, value: reached });
-    const drop = Math.max(0, from - reached);
+    const drop = Math.max(0, previous - reached);
     if (drop > 0) {
       const dropName = `${prevLabel} → dropped`;
       addNode(dropName, COLORS.status.failed());
       links.push({ source: prevLabel, target: dropName, value: drop });
     }
+    previous = reached;
   }
   return { nodes, links, failures };
 }
 
 export function update(snapshot) {
   if (!chart) return;
-  const { nodes, links } = buildGraph(snapshot.funnel, snapshot.failures);
+  const f = snapshot.funnel;
+  const { nodes, links } = buildGraph(f, snapshot.failures);
+  describeChart(container, `Funnel of distinct ideas: ${f.generated} generated, ${f.coded} coded, ${f.static} passed static checks, `
+    + `${f.sandbox} ran in the sandbox, ${f.lookahead} passed lookahead, ${f.train} reached the train gate, `
+    + `${f.critic} passed the critic, ${f.validation} passed validation.`);
   chart.setOption({
     ...baseText(),
     tooltip: { trigger: "item" },

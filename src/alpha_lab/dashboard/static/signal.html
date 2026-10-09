@@ -3,22 +3,25 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'">
   <title>Alpha Lab · Signal inspector</title>
   <link rel="stylesheet" href="/static/css/tokens.css">
-  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
 </head>
 <body>
   <header class="topbar">
     <h1 id="title">Signal inspector</h1>
     <span id="demo-badge" class="badge-demo" hidden>DEMO DATA</span>
-    <nav style="margin-left:auto">
+    <nav style="margin-left:auto" aria-label="Pages">
       <a href="/">mission control</a>
+      <a href="/live">live</a>
       <a href="/research">research</a>
     </nav>
   </header>
   <main class="grid">
     <section class="panel span-12" id="idea"></section>
-    <section class="panel span-6"><h2>Revision tree</h2><p class="note">Each attempt is a node. Colour is the outcome. Click a node to show its code.</p><div id="tree" class="chart"></div></section>
+    <section class="panel span-6"><h2>Revision tree</h2><p class="note">Each attempt is a node. Colour is the outcome. Click a node, or an attempt below it, to show its code.</p><div id="tree" class="chart"></div>
+      <ol id="attempts" class="attempts" aria-label="Attempts"></ol></section>
     <section class="panel span-6"><h2>Metrics</h2><div id="metrics"></div></section>
     <section class="panel span-12"><h2>Code</h2><div id="diff"></div></section>
     <section class="panel span-6"><h2>Critic</h2><div id="critic"></div></section>

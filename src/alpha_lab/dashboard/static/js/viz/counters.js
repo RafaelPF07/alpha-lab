@@ -13,6 +13,7 @@ const DEFS = [
 
 let refs = null;
 const shown = {};
+const frames = {}; // key -> the animation frame in progress, so a new target replaces it
 
 export function init(container) {
   container.innerHTML = "";
@@ -30,6 +31,7 @@ export function init(container) {
 }
 
 function ease(key, target) {
+  cancelAnimationFrame(frames[key]);
   const start = shown[key] ?? 0;
   const t0 = performance.now();
   const step = (now) => {
@@ -37,9 +39,9 @@ function ease(key, target) {
     const value = start + (target - start) * (1 - Math.pow(1 - k, 3));
     shown[key] = value;
     refs[key].el.textContent = refs[key].fmt(value);
-    if (k < 1) requestAnimationFrame(step);
+    frames[key] = k < 1 ? requestAnimationFrame(step) : undefined;
   };
-  requestAnimationFrame(step);
+  frames[key] = requestAnimationFrame(step);
 }
 
 export function update(snapshot) {

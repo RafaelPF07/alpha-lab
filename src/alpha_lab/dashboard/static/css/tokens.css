@@ -9,6 +9,14 @@
   --muted: #8a94a8;
   --accent: #6ea8fe;
 
+  /* Text and focus colours. The accents above are for fills and lines; these are for text and focus rings,
+     and each one keeps AA contrast on the panel in its theme. */
+  --focus: #6ea8fe;
+  --ok-text: #9ece6a;
+  --warn-text: #e0af68;
+  --bad-text: #f7768e;
+  --accent-text: #6ea8fe;
+
   /* Stages */
   --stage-idea: #7aa2f7;
   --stage-code: #9ece6a;
@@ -49,10 +57,31 @@
     --border: #d9deea;
     --text: #1b2130;
     --muted: #5b6478;
+    --focus: #2456b8;
+    --ok-text: #3b6e1f;
+    --warn-text: #8a5a00;
+    --bad-text: #b02a45;
+    --accent-text: #2456b8;
   }
 }
 
 * { box-sizing: border-box; }
+
+/* A visible focus ring for every control, so keyboard users can see where they are. */
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+/* Text for screen readers only. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 
 body {
   margin: 0;
@@ -83,6 +112,17 @@ header.topbar nav a.active, header.topbar nav a:hover { color: var(--text); }
   background: var(--status-budget);
   color: #111;
 }
+
+/* Shown above the page content when a load or the charts fail. */
+.page-error {
+  margin: var(--space-3) var(--space-4) 0;
+  padding: 10px 14px;
+  border: 1px solid var(--bad-text);
+  border-radius: 8px;
+  background: rgba(247, 118, 142, 0.10);
+  color: var(--text);
+}
+.page-error[hidden] { display: none; }
 
 .grid {
   display: grid;
@@ -123,11 +163,35 @@ header.topbar nav a.active, header.topbar nav a:hover { color: var(--text); }
 .counter { font-family: var(--font-mono); font-size: 28px; font-weight: 600; }
 .counter-label { color: var(--muted); font-size: 12px; }
 
+/* The ticker rows are buttons, so each one can be reached and opened with the keyboard. */
 .ticker { height: 280px; overflow-y: auto; overflow-x: hidden; font-family: var(--font-mono); font-size: 12px; }
-.ticker .row { padding: 3px 0; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
-.ticker .tag { display: inline-block; line-height: 1.5; }
-.ticker .row:hover { background: var(--panel-2); cursor: pointer; }
-.ticker .tag { padding: 0 6px; border-radius: 4px; color: #111; font-weight: 600; }
+.ticker .row {
+  width: 100%;
+  padding: 3px 0;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+}
+.ticker button.row { cursor: pointer; }
+.ticker .row:hover, .ticker button.row:focus-visible { background: var(--panel-2); }
+.ticker .tag { display: inline-block; line-height: 1.5; padding: 0 6px; border-radius: 4px; color: #111; font-weight: 600; }
+.ticker .time, .ticker .pipe { color: var(--muted); }
+.ticker .agent { color: var(--text); display: inline-flex; align-items: center; gap: 5px; }
+.ticker .agent::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--c, var(--muted));
+}
+.ticker .text { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
 
 .mono { font-family: var(--font-mono); }
 pre.code {
@@ -144,9 +208,33 @@ table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
 table.data th, table.data td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
 table.data td.num, table.data th.num { text-align: right; font-family: var(--font-mono); }
 
-.locked { color: var(--stage-holdout); font-style: italic; }
+/* Locked means "not yet", so it is shown in the muted text colour, which passes contrast in both themes. */
+.locked { color: var(--muted); font-style: italic; }
 
+/* Attempts of one idea, as buttons beside the revision tree. */
+.attempts { list-style: none; margin: var(--space-2) 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.attempts button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.attempts button[aria-pressed="true"] { border-color: var(--focus); }
+
+/* A plain list of validated signals, so each point can be opened without the chart. */
+details.signal-list { margin-top: var(--space-2); font-size: 13px; }
+details.signal-list summary { cursor: pointer; color: var(--muted); }
+details.signal-list ol { margin: var(--space-2) 0 0; padding-left: 20px; max-height: 220px; overflow-y: auto; }
+details.signal-list li { margin: 3px 0; }
+
+/* Phone and small tablets: one column, and the same 16px gutter as the grid. */
 @media (max-width: 900px) {
   .grid { grid-template-columns: 1fr; padding: var(--space-3); }
   .span-3, .span-4, .span-6, .span-8, .span-12 { grid-column: span 1; }
+  header.topbar { padding: var(--space-3); }
+  .page-error { margin: var(--space-3) var(--space-3) 0; }
 }

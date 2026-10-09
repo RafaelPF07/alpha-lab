@@ -1,27 +1,39 @@
 // Cost by agent over time, as a stacked area. Shows which agent is driving the spend.
-import { COLORS, agentColor, baseAxis, baseText, track } from "./common.js";
+import { COLORS, agentColor, baseAxis, baseText, describeChart, plural, track } from "./common.js";
 
 let chart = null;
+let container = null;
 const BINS = 40;
 
-export function init(container) {
-  chart = track(echarts.init(container, null, { renderer: "canvas" }));
+export function init(el) {
+  container = el;
+  chart = track(echarts.init(el, null, { renderer: "canvas" }));
   return chart;
 }
 
 export function update(snapshot) {
   if (!chart) return;
   const agents = Object.keys(snapshot.agentSpend);
-  const all = agents.flatMap((a) => snapshot.agentSpend[a].map((p) => Date.parse(p.t)));
-  if (!all.length) { chart.clear(); return; }
-  const lo = Math.min(...all);
-  const hi = Math.max(...all, lo + 1);
+  // Loops, not spread arguments: a spread of many calls can exceed the engine's argument limit (FE-20).
+  let lo = Infinity;
+  let hi = -Infinity;
+  let calls = 0;
+  for (const agent of agents) {
+    for (const p of snapshot.agentSpend[agent]) {
+      const t = Date.parse(p.t);
+      calls += 1;
+      if (t < lo) lo = t;
+      if (t > hi) hi = t;
+    }
+  }
+  if (!Number.isFinite(lo)) { describeChart(container, "Cost by agent: no calls yet."); chart.clear(); return; }
+  hi = Math.max(hi, lo + 1);
   const width = (hi - lo) / BINS;
   const xs = Array.from({ length: BINS }, (_, i) => lo + (i + 0.5) * width);
   const series = agents.map((agent) => {
     const bins = new Array(BINS).fill(0);
     for (const p of snapshot.agentSpend[agent]) {
-      const i = Math.min(BINS - 1, Math.floor((Date.parse(p.t) - lo) / width));
+      const i = Math.min(BINS - 1, Math.max(0, Math.floor((Date.parse(p.t) - lo) / width)));
       bins[i] += p.cost;
     }
     let running = 0;
@@ -36,6 +48,7 @@ export function update(snapshot) {
       data: xs.map((x, i) => [x, cumulative[i]]),
     };
   });
+  describeChart(container, `Cost by agent: ${plural(calls, "LLM call")} across ${plural(agents.length, "agent")}.`);
   chart.setOption({
     ...baseText(),
     animation: false,

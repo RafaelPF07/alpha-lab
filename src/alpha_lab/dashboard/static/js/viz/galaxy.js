@@ -1,15 +1,18 @@
 // Signal galaxy: every validated signal, train Sharpe against validation Sharpe. Most points should
 // fall below the y = x line, which is the visual evidence of overfitting decay.
-import { COLORS, baseAxis, baseText, track } from "./common.js";
+import { COLORS, baseAxis, baseText, describeChart, plural, track } from "./common.js";
+import { esc } from "../core/escape.js";
 
 let chart = null;
+let container = null;
 let colorBy = "theme";
 
-export function init(container) {
-  chart = track(echarts.init(container, null, { renderer: "canvas" }));
+export function init(el) {
+  container = el;
+  chart = track(echarts.init(el, null, { renderer: "canvas" }));
   chart.on("click", (p) => {
     if (p.data?.attempt_id) {
-      container.dispatchEvent(new CustomEvent("signal-select", { detail: p.data.attempt_id, bubbles: true }));
+      el.dispatchEvent(new CustomEvent("signal-select", { detail: p.data.attempt_id, bubbles: true }));
     }
   });
   return chart;
@@ -18,6 +21,9 @@ export function init(container) {
 export function setColorBy(mode) { colorBy = mode; }
 
 const PALETTE = ["#7aa2f7", "#9ece6a", "#ff9e64", "#f7768e", "#bb9af7", "#7dcfff", "#e0af68", "#73daca"];
+
+// A missing number shows as n/a. Number(null) is 0, which would print a false 0.000.
+const fmt3 = (x) => (Number.isFinite(x) ? x.toFixed(3) : "n/a");
 
 export function update(galaxy) {
   if (!chart) return;
@@ -40,9 +46,14 @@ export function update(galaxy) {
     })),
     itemStyle: { color: PALETTE[i % PALETTE.length], opacity: 0.85 },
   }));
-  const all = points.flatMap((p) => [p.train_sharpe, p.validation_sharpe]);
-  const lo = all.length ? Math.min(...all) : -1;
-  const hi = all.length ? Math.max(...all) : 1;
+  // Loops, not spread arguments: a spread of many values can exceed the engine's argument limit.
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const p of points) {
+    lo = Math.min(lo, p.train_sharpe, p.validation_sharpe);
+    hi = Math.max(hi, p.train_sharpe, p.validation_sharpe);
+  }
+  if (!points.length) { lo = -1; hi = 1; }
   series.push({
     name: "y = x",
     type: "line",
@@ -50,6 +61,11 @@ export function update(galaxy) {
     symbol: "none",
     lineStyle: { color: COLORS.muted, type: "dashed" },
   });
+
+  const below = points.filter((p) => p.validation_sharpe < p.train_sharpe).length;
+  describeChart(container, `Signal galaxy: ${plural(points.length, "validated signal")}, ${below} with lower validation `
+    + "Sharpe than train Sharpe. Each one can be opened from the list below the chart.");
+
   chart.setOption({
     ...baseText(),
     grid: { left: 70, right: 20, top: 56, bottom: 44 },
@@ -57,8 +73,9 @@ export function update(galaxy) {
     tooltip: {
       formatter: (p) => {
         const d = p.data || {};
-        if (!d.name) return p.seriesName;
-        return `${d.name}<br>train ${d.value[0].toFixed(3)} · validation ${d.value[1].toFixed(3)}<br>deflated ${Number(d.deflated).toFixed(3)}`;
+        if (!d.name) return esc(p.seriesName);
+        const deflated = d.deflated == null ? null : Number(d.deflated);
+        return `${esc(d.name)}<br>train ${fmt3(d.value[0])} · validation ${fmt3(d.value[1])}<br>deflated ${fmt3(deflated)}`;
       },
     },
     xAxis: { type: "value", name: "train Sharpe (annualised)", nameLocation: "middle", nameGap: 26, ...baseAxis() },

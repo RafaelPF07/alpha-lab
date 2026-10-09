@@ -1,12 +1,21 @@
 // Pipeline swimlanes: one row per pipeline. LLM calls are coloured segments, checks and
 // backtests are markers, so concurrency, bottlenecks and revisions are visible at a glance.
-import { COLORS, agentColor, baseAxis, baseText, statusColor, track } from "./common.js";
+import { COLORS, agentColor, baseAxis, baseText, describeChart, plural, track } from "./common.js";
+import { esc } from "../core/escape.js";
 
 let chart = null;
+let container = null;
 let autoscroll = true;
+// The zoom window in percent of the time axis. A user's zoom is kept across redraws (FE-10).
+let zoom = { start: 0, end: 100 };
 
-export function init(container) {
-  chart = track(echarts.init(container, null, { renderer: "canvas" }));
+export function init(el) {
+  container = el;
+  chart = track(echarts.init(el, null, { renderer: "canvas" }));
+  chart.on("datazoom", (e) => {
+    const b = e.batch?.[0] ?? e;
+    if (Number.isFinite(b?.start) && Number.isFinite(b?.end)) zoom = { start: b.start, end: b.end };
+  });
   return chart;
 }
 
@@ -31,11 +40,18 @@ export function update(snapshot) {
     }
   });
 
+  // With auto-scroll, the window keeps its width and follows the newest end of the axis.
+  if (autoscroll) {
+    const width = zoom.end - zoom.start;
+    zoom = { start: Math.max(0, 100 - width), end: 100 };
+  }
+
+  describeChart(container, `Pipeline swimlanes: ${plural(lanes.length, "pipeline")} shown, one row each.`);
   chart.setOption({
     ...baseText(),
     animation: false,
     grid: { left: 110, right: 20, top: 16, bottom: 36 },
-    tooltip: { formatter: (p) => `${p.seriesName}: ${p.value?.[5] ?? ""}` },
+    tooltip: { formatter: (p) => `${esc(p.seriesName)}: ${esc(p.value?.[5] ?? "")}` },
     xAxis: { type: "time", ...baseAxis(), axisLabel: { color: COLORS.muted, formatter: (v) => new Date(v).toISOString().slice(11, 19) } },
     yAxis: {
       type: "category",
@@ -72,6 +88,6 @@ export function update(snapshot) {
         data: markers.map((m) => m.value),
       },
     ],
-    dataZoom: autoscroll ? [{ type: "inside", xAxisIndex: 0, start: 0, end: 100 }] : [],
+    dataZoom: [{ type: "inside", xAxisIndex: 0, start: zoom.start, end: zoom.end }],
   }, true);
 }
