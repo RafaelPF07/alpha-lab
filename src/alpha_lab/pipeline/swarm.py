@@ -48,7 +48,8 @@ async def run_swarm(
     progress: SwarmProgress | None = None,
     on_progress: Callable[[SwarmProgress], None] | None = None,
 ) -> list[PipelineResult]:
-    """Start N pipelines, at most `max_concurrency` at a time. Stops starting new ones when the budget is gone."""
+    """Start N pipelines, at most `max_concurrency` at a time. Stops starting new ones when the budget
+    is gone. A pipeline records its own failures, so only errors that must end the run get here."""
     themes = pick_themes(ctx.settings.diversity.themes, n_pipelines, seed)
     progress = progress or SwarmProgress(total=n_pipelines, budget=budget)
     semaphore = asyncio.Semaphore(max_concurrency)
@@ -77,5 +78,15 @@ async def run_swarm(
             if on_progress:
                 on_progress(progress)
 
-    await asyncio.gather(*(one(theme) for theme in themes))
+    tasks = [asyncio.create_task(one(theme)) for theme in themes]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        # A fatal error ends the run. gather would re-raise at once and leave the other pipelines
+        # running, so cancel them and wait. Nothing may call the API or write to the ledger after
+        # the caller records the run as finished.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     return results

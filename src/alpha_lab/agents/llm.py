@@ -10,33 +10,42 @@ import asyncio
 import json
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import anthropic
 from pydantic import BaseModel, ValidationError
 
-from alpha_lab.agents.budget import Budget
+from alpha_lab.agents.budget import Budget, BudgetExceeded
 from alpha_lab.config import ModelPricing, Settings
 from alpha_lab.events.bus import EventBus, PipelineEvent
 from alpha_lab.ledger.db import Ledger
 
 MAX_ATTEMPTS = 4
 
-# Some models reject a forced tool choice with a 400 error. For those, the model is
-# asked to use the tool and the one-repair logic in structured_call handles a miss.
+# claude-sonnet-5-5 rejected a forced tool choice with a 400 error in a live critic call (commit
+# 23cd375). Those models are asked to use the tool, and the one-repair logic handles a miss.
 MODELS_WITHOUT_FORCED_TOOL_CHOICE = frozenset({"claude-sonnet-5-5"})
 
 
-def _tool_choice(model: str, tool_name: str) -> dict[str, str]:
+def _tool_choice(model: str, tool_name: str) -> dict[str, Any]:
+    """The tool_choice sent with every request. Parallel tool use is off, so a reply holds at most
+    one tool call, and the repair message can answer it. disable_parallel_tool_use is a field of
+    the SDK's ToolChoiceAutoParam and ToolChoiceToolParam."""
     if model in MODELS_WITHOUT_FORCED_TOOL_CHOICE:
-        return {"type": "auto"}
-    return {"type": "tool", "name": tool_name}
+        return {"type": "auto", "disable_parallel_tool_use": True}
+    return {"type": "tool", "name": tool_name, "disable_parallel_tool_use": True}
 
 
 BACKOFF_BASE_SECONDS = 1.0
+# A retry-after from the server is honoured, but never for longer than this.
+MAX_RETRY_AFTER_SECONDS = 60.0
+# The SDK's own list. 5xx and 529 (overloaded) are retried as well.
+RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
 CHARS_PER_TOKEN = 3.5  # conservative estimate, used instead of a count_tokens round trip
+# stop_reason values that mean the reply was cut off before it was complete.
+TRUNCATED_STOP_REASONS = frozenset({"max_tokens", "model_context_window_exceeded"})
 
 
 class ContextLimitExceeded(ValueError):
@@ -45,6 +54,11 @@ class ContextLimitExceeded(ValueError):
 
 class StepFailed(RuntimeError):
     """The model did not return valid output, even after one repair attempt."""
+
+
+class OutputTruncated(StepFailed):
+    """The reply hit max_tokens before the tool call was complete. Not repaired, because the same
+    request would be cut off again."""
 
 
 @dataclass(frozen=True)
@@ -64,8 +78,9 @@ class Usage:
 def compute_cost(pricing: ModelPricing, usage: Usage, long_context_threshold: int) -> float:
     """USD for one call. Prompts above the threshold use the *_over_100k prices when given.
 
-    Cache writes have no separate price in settings.toml, so they are charged at the
-    input rate. That is an approximation, and it is reported to the user.
+    Cache writes are charged at the base input rate, because settings.toml has no cache-write
+    price. The documented 5-minute write price is higher (1.25 times the input price), so writes
+    are under-counted until that price is configured.
     """
     prompt_size = usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens
     over = prompt_size > long_context_threshold
@@ -90,12 +105,50 @@ def estimate_tokens(texts: list[str]) -> int:
 
 
 def _is_retryable(exc: Exception) -> bool:
+    """Retry what the SDK retries: timeouts, conflicts, rate limits, 5xx and connection errors.
+
+    As in the SDK, an x-should-retry header overrides the status code.
+    """
     if isinstance(exc, anthropic.APIStatusError):
-        # 529 is "overloaded", which the SDK reports as a generic status error.
-        return isinstance(exc, (anthropic.RateLimitError, anthropic.InternalServerError)) or (
-            exc.status_code == 529
-        )
-    return isinstance(exc, anthropic.APIConnectionError)
+        hint = exc.response.headers.get("x-should-retry")
+        if hint == "false":
+            return False
+        if hint == "true":
+            return True
+        return exc.status_code in RETRYABLE_STATUS_CODES or exc.status_code >= 500
+    return isinstance(exc, anthropic.APIConnectionError)  # includes timeouts
+
+
+def _retry_delay(exc: Exception, attempt: int) -> float:
+    """Seconds before the next attempt: the server's retry-after when it sent one, else backoff."""
+    if isinstance(exc, anthropic.APIStatusError):
+        requested = _retry_after(exc.response.headers)
+        if requested is not None and requested > 0:
+            return min(requested, MAX_RETRY_AFTER_SECONDS)
+    return BACKOFF_BASE_SECONDS * 2 ** (attempt - 1)
+
+
+def _retry_after(headers: Mapping[str, str]) -> float | None:
+    """Seconds from retry-after-ms or retry-after. The HTTP-date form is not parsed, so backoff applies."""
+    for name, scale in (("retry-after-ms", 0.001), ("retry-after", 1.0)):
+        raw = headers.get(name)
+        if raw is None:
+            continue
+        try:
+            return float(raw) * scale
+        except ValueError:
+            continue
+    return None
+
+
+def _describe_errors(exc: ValidationError) -> str:
+    """One line per problem, naming the field and the rule. The rejected input is left out, so the
+    repair message never repeats the model's output."""
+    parts = []
+    for error in exc.errors(include_url=False, include_input=False, include_context=False):
+        where = ".".join(str(part) for part in error["loc"]) or "input"
+        parts.append(f"{where}: {error['msg']}")
+    return "; ".join(parts)
 
 
 class LLMClient:
@@ -157,6 +210,12 @@ class LLMClient:
                 pipeline_id=pipeline_id,
                 idea_id=idea_id,
             )
+            if response.stop_reason in TRUNCATED_STOP_REASONS:
+                raise OutputTruncated(
+                    f"{agent} reply was cut off at max_tokens="
+                    f"{self.settings.agents.max_tokens_per_call} before the tool call was complete. "
+                    "It was not repaired, because the same request would be cut off again."
+                )
             messages.append({"role": "assistant", "content": _blocks_to_dicts(response.content)})
             tool_block = next(
                 (b for b in response.content if b.type == "tool_use" and b.name == tool_name),
@@ -168,7 +227,7 @@ class LLMClient:
             try:
                 return output_model.model_validate(tool_block.input)
             except ValidationError as exc:
-                last_problem = f"the tool input failed validation: {exc.errors(include_url=False)}"
+                last_problem = f"the tool input failed validation: {_describe_errors(exc)}"
                 messages.append(
                     {
                         "role": "user",
@@ -201,17 +260,23 @@ class LLMClient:
         if pricing is None:
             raise KeyError(f"no pricing configured for model {model!r}")
 
+        call_id = uuid.uuid4().hex
         input_text = [prompt.text, json.dumps(messages, default=str), json.dumps(tool)]
         est_input = estimate_tokens(input_text)
         if est_input > self.settings.agents.context_limit_tokens:
-            raise ContextLimitExceeded(
+            reason = (
                 f"{agent} request is about {est_input} tokens, over the limit of "
                 f"{self.settings.agents.context_limit_tokens}; refusing to truncate"
             )
+            self._refuse(call_id, agent, model, prompt, pipeline_id, idea_id, None, reason)
+            raise ContextLimitExceeded(reason)
 
         est_cost = (est_input * pricing.input + max_tokens * pricing.output) / 1_000_000
-        self.budget.reserve(est_cost)
-        call_id = uuid.uuid4().hex
+        try:
+            self.budget.reserve(est_cost)
+        except BudgetExceeded as exc:
+            self._refuse(call_id, agent, model, prompt, pipeline_id, idea_id, est_cost, str(exc))
+            raise
         started = time.perf_counter()
         self._emit(
             "llm_call_started",
@@ -229,7 +294,6 @@ class LLMClient:
 
         response = None
         usage: Usage | None = None
-        actual_cost = 0.0
         status = "error"
         try:
             response = await self._call_with_retries(
@@ -241,12 +305,20 @@ class LLMClient:
                 cache_read_tokens=response.usage.cache_read_input_tokens or 0,
                 cache_write_tokens=response.usage.cache_creation_input_tokens or 0,
             )
-            actual_cost = compute_cost(
-                pricing, usage, self.settings.pricing.long_context_threshold_tokens
-            )
             status = "ok"
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
         finally:
             latency_ms = int((time.perf_counter() - started) * 1000)
+            if usage is None:
+                # No usage report (an error or a cancellation). The request may still have been
+                # processed, so the reservation is charged. This is the conservative choice.
+                actual_cost = est_cost
+            else:
+                actual_cost = compute_cost(
+                    pricing, usage, self.settings.pricing.long_context_threshold_tokens
+                )
             self.budget.settle(est_cost, actual_cost)
             self.ledger.add_llm_call(
                 call_id=call_id,
@@ -288,6 +360,47 @@ class LLMClient:
             )
         return response
 
+    def _refuse(
+        self,
+        call_id: str,
+        agent: str,
+        model: str,
+        prompt: PromptSpec,
+        pipeline_id: str | None,
+        idea_id: str | None,
+        estimated_cost: float | None,
+        reason: str,
+    ) -> None:
+        """Record a call that was never sent, so the refusal leaves a trace. It costs nothing."""
+        self.ledger.add_llm_call(
+            call_id=call_id,
+            run_id=self.run_id,
+            idea_id=idea_id,
+            agent=agent,
+            model=model,
+            prompt_version=prompt.name,
+            input_tokens=None,
+            output_tokens=None,
+            cache_read_tokens=None,
+            cache_write_tokens=None,
+            cost_usd=0.0,
+            latency_ms=None,
+            status="refused",
+        )
+        self._emit(
+            "llm_call_refused",
+            "llm",
+            agent,
+            pipeline_id,
+            idea_id,
+            {
+                "call_id": call_id,
+                "model": model,
+                "reason": reason,
+                "estimated_cost_usd": estimated_cost,
+            },
+        )
+
     async def _call_with_retries(self, **kwargs: Any) -> Any:
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
@@ -302,7 +415,7 @@ class LLMClient:
             except Exception as exc:
                 if not _is_retryable(exc) or attempt == MAX_ATTEMPTS:
                     raise
-                await self._sleep(BACKOFF_BASE_SECONDS * 2 ** (attempt - 1))
+                await self._sleep(_retry_delay(exc, attempt))
         raise AssertionError("unreachable")
 
     def _emit(

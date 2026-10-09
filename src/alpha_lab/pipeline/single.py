@@ -1,30 +1,41 @@
-"""One idea -> dedup -> code -> checks -> train backtest -> critic -> revise loop.
+"""One idea -> dedup -> code -> checks -> train backtest -> critic -> revise loop -> validation.
 
-This stage only ever sees prices up to train_end. Validation and holdout
-data never reach an agent, a sandbox or an event payload.
+Agents see training data only (prices through train_end). The validation gate runs once, after
+the revision loop, on history through validation_end. Holdout data never reaches an agent, a
+sandbox or an event payload. Every pipeline ends with exactly one pipeline_finished event.
 
-Attempt statuses, in funnel order:
-  failed_static, rejected_duplicate_code, failed_sandbox, failed_lookahead,
-  failed_gate, failed_critic, critic_pass
+Attempt statuses (attempts.status). A failed attempt is followed by a revision, until the revision
+cap is reached, except failed_critic_output, which ends the pipeline:
+  failed_static, rejected_duplicate_code, failed_sandbox, failed_lookahead, failed_backtest,
+  failed_gate, failed_critic, failed_critic_output, critic_pass,
+  validation_pass, validation_fail (set on the last attempt only),
+  aborted_budget, aborted_error (an exception stopped the attempt)
+
+Pipeline statuses (pipeline_finished and PipelineResult.status): the attempt statuses above, plus
+  failed_ideas, failed_coder (the model gave no usable output),
+  failed_api (the API failed after retries), failed_error (an unexpected error),
+  aborted_budget, aborted_error.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
+import math
 import uuid
 from dataclasses import asdict, dataclass
 from typing import Any
 
+import anthropic
 import pandas as pd
 
+from alpha_lab.agents.budget import BudgetExceeded
 from alpha_lab.agents.coder import Revision, write_signal_code
 from alpha_lab.agents.critic import critique_signal
 from alpha_lab.agents.ideas import generate_idea
 from alpha_lab.agents.llm import ContextLimitExceeded, LLMClient, PromptSpec, StepFailed
 from alpha_lab.agents.models import CoderOutput, CriticOutput, IdeaOutput
-from alpha_lab.backtest.engine import run_backtest
+from alpha_lab.backtest.engine import BacktestDataError, run_backtest
 from alpha_lab.backtest.holding import hold_weights
 from alpha_lab.checks.dedup import idea_similarity, normalised_code_hash
 from alpha_lab.checks.lookahead import LookaheadResult, run_lookahead_tests
@@ -32,10 +43,14 @@ from alpha_lab.checks.sandbox import SandboxedSignal, SandboxFailure, SandboxOut
 from alpha_lab.checks.static import static_check
 from alpha_lab.config import Settings
 from alpha_lab.events.bus import EventBus, PipelineEvent
-from alpha_lab.ledger.db import Ledger
+from alpha_lab.ledger.db import Ledger, strict_json
 from alpha_lab.pipeline.validation import validate_signal
 
 IDEA_RETRIES_ON_DUPLICATE = 2
+# No revision after these: the critic gave no usable review, so there is no feedback to send the coder.
+NO_REVISION_STATUSES = frozenset({"failed_critic_output"})
+# API errors that end the whole run. Every later call would fail the same way.
+FATAL_API_ERRORS = (anthropic.AuthenticationError, anthropic.PermissionDeniedError)
 
 
 @dataclass(frozen=True)
@@ -71,6 +86,26 @@ class AttemptOutcome:
     attempt_id: str | None = None
 
 
+@dataclass
+class _PipelineProgress:
+    """How far a pipeline got. Read when it ends, whatever the reason."""
+
+    status: str = "aborted_error"
+    error: str | None = "the pipeline ended before it finished"
+    idea: IdeaOutput | None = None
+    attempts: int = 0
+
+
+@dataclass
+class _AttemptChecks:
+    """The checks an attempt has passed so far. Written to the ledger if an exception stops it."""
+
+    static_ok: bool | None = None
+    sandbox_ok: bool | None = None
+    lookahead_ok: bool | None = None
+    metrics: dict[str, Any] | None = None
+
+
 def code_hash(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
@@ -104,9 +139,10 @@ async def _draft_unique_idea(
 ) -> tuple[IdeaOutput, str]:
     """Draft an idea that is not a near-copy of the ledger, and record it.
 
-    Holds ctx.idea_lock across the draft, the duplicate check and the insert.
-    Without the lock, two pipelines could both pass the check with the same
-    idea before either one was written down.
+    Drafts are serialised on ctx.idea_lock, so each draft is written after the ideas accepted
+    before it, and its prompt lists them. That avoids drafting duplicates. Safety does not depend
+    on the lock: the duplicate check and the insert run with no await between them, so two
+    pipelines cannot both accept the same idea.
     """
     settings = ctx.settings
     threshold = settings.dedup.similarity_threshold
@@ -123,7 +159,7 @@ async def _draft_unique_idea(
             best_score, best_id = 0.0, None
             for old in ctx.ledger.all_ideas():
                 score = idea_similarity(
-                    idea.name, idea.description, old["name"], old["description"]
+                    idea.name, idea.description, old["name"], old["description"], floor=threshold
                 )
                 if score > best_score:
                     best_score, best_id = score, old["idea_id"]
@@ -162,14 +198,61 @@ async def _draft_unique_idea(
 
 
 async def run_single_pipeline(ctx: PipelineContext, theme: str) -> PipelineResult:
-    settings = ctx.settings
+    """Run one pipeline to a terminal status and always emit its pipeline_finished event.
+
+    Only BudgetExceeded and the fatal API errors are raised, because they end the whole run. Every
+    other failure becomes this pipeline's status, and the run goes on.
+    """
     pipeline_id = uuid.uuid4().hex
     _emit(ctx, "pipeline_started", "pipeline", pipeline_id, None, None, None, {"theme": theme})
+    progress = _PipelineProgress()
+    try:
+        await _run_stages(ctx, pipeline_id, theme, progress)
+    except BudgetExceeded as exc:
+        progress.status, progress.error = "aborted_budget", str(exc)
+        raise
+    except FATAL_API_ERRORS as exc:
+        progress.status, progress.error = "aborted_error", f"{type(exc).__name__}: {exc}"
+        raise
+    except anthropic.APIError as exc:
+        progress.status, progress.error = "failed_api", f"{type(exc).__name__}: {exc}"
+    except Exception as exc:  # noqa: BLE001 - one pipeline's failure must not end the run
+        progress.status, progress.error = "failed_error", f"{type(exc).__name__}: {exc}"
+    finally:
+        _emit(
+            ctx,
+            "pipeline_finished",
+            "pipeline",
+            pipeline_id,
+            None,
+            None,
+            None,
+            {
+                "status": progress.status,
+                "attempts": progress.attempts,
+                "error": progress.error,
+                "theme": theme,
+            },
+        )
+    return PipelineResult(
+        pipeline_id=pipeline_id,
+        status=progress.status,
+        idea_name=progress.idea.name if progress.idea else None,
+        theme=theme,
+        attempts=progress.attempts,
+    )
 
+
+async def _run_stages(
+    ctx: PipelineContext, pipeline_id: str, theme: str, progress: _PipelineProgress
+) -> None:
+    settings = ctx.settings
     try:
         idea, idea_id = await _draft_unique_idea(ctx, pipeline_id, theme)
     except (StepFailed, ContextLimitExceeded) as exc:
-        return _finish(ctx, pipeline_id, "failed_ideas", None, theme, 0, str(exc))
+        progress.status, progress.error = "failed_ideas", str(exc)
+        return
+    progress.idea = idea
 
     _emit(
         ctx,
@@ -199,20 +282,21 @@ async def run_single_pipeline(ctx: PipelineContext, theme: str) -> PipelineResul
             idea_id=idea_id,
         )
     except (StepFailed, ContextLimitExceeded) as exc:
-        return _finish(ctx, pipeline_id, "failed_coder", idea, theme, 0, str(exc))
+        progress.status, progress.error = "failed_coder", str(exc)
+        return
 
-    status = "failed"
-    attempts = 0
-    last: AttemptOutcome | None = None
     max_attempts = settings.agents.max_revisions + 1
+    last: AttemptOutcome | None = None
     for attempt_number in range(1, max_attempts + 1):
-        attempts = attempt_number
+        progress.attempts = attempt_number
         outcome = await _check_attempt(ctx, pipeline_id, idea_id, idea, code, attempt_number)
-        status = outcome.status
         last = outcome
-        if status == "critic_pass":
-            break
-        if attempt_number == max_attempts:
+        progress.status, progress.error = outcome.status, outcome.failure
+        if (
+            outcome.status == "critic_pass"
+            or outcome.status in NO_REVISION_STATUSES
+            or attempt_number == max_attempts
+        ):
             break
 
         _emit(
@@ -223,7 +307,7 @@ async def run_single_pipeline(ctx: PipelineContext, theme: str) -> PipelineResul
             idea_id,
             attempt_number + 1,
             "coder",
-            {"reason": status},
+            {"reason": outcome.status},
         )
         try:
             code = await write_signal_code(
@@ -233,71 +317,69 @@ async def run_single_pipeline(ctx: PipelineContext, theme: str) -> PipelineResul
                 idea=idea,
                 revision=Revision(
                     previous_code=code.code,
-                    failure=outcome.failure or status,
+                    failure=outcome.failure or outcome.status,
                     train_metrics=outcome.metrics,
                 ),
                 pipeline_id=pipeline_id,
                 idea_id=idea_id,
             )
         except (StepFailed, ContextLimitExceeded) as exc:
-            return _finish(ctx, pipeline_id, "failed_coder", idea, theme, attempts, str(exc))
+            progress.status, progress.error = "failed_coder", str(exc)
+            return
 
-    if status == "critic_pass" and last is not None and last.attempt_id is not None:
+    if progress.status == "critic_pass" and last is not None and last.attempt_id is not None:
+        await _validate(ctx, pipeline_id, idea_id, idea, code, last.attempt_id, progress)
+
+
+async def _validate(
+    ctx: PipelineContext,
+    pipeline_id: str,
+    idea_id: str,
+    idea: IdeaOutput,
+    code: CoderOutput,
+    attempt_id: str,
+    progress: _PipelineProgress,
+) -> None:
+    try:
         verdict = await asyncio.to_thread(
             validate_signal,
             code.code,
             ctx.validation_prices,
-            settings,
+            ctx.settings,
             idea.expected_holding_period_days,
         )
+    except BaseException as exc:
+        # The attempt passed the critic, but validation did not finish. It must not stay critic_pass.
+        ctx.ledger.update_attempt(
+            attempt_id, status="aborted_error", error=f"{type(exc).__name__}: {exc}"
+        )
+        raise
+    if verdict.data_error:
+        # The validation window could not be scored, so there is no pass or fail to record.
+        ctx.ledger.update_attempt(attempt_id, status="failed_backtest", error=verdict.error)
+        progress.status, progress.error = "failed_backtest", verdict.error
+        return
+    status = "validation_pass" if verdict.passed else "validation_fail"
+    with ctx.ledger.transaction():
         ctx.ledger.add_validation(
-            last.attempt_id,
+            attempt_id,
             ctx.run_id,
             verdict.metrics,
             verdict.passed,
             verdict.error,
             verdict.returns,
         )
-        status = "validation_pass" if verdict.passed else "validation_fail"
-        ctx.ledger.update_attempt(last.attempt_id, status=status)
-        _emit(
-            ctx,
-            "validation_result",
-            "validation",
-            pipeline_id,
-            idea_id,
-            attempts,
-            "validation",
-            {"passed": verdict.passed},
-        )
-    return _finish(ctx, pipeline_id, status, idea, theme, attempts, None)
-
-
-def _finish(
-    ctx: PipelineContext,
-    pipeline_id: str,
-    status: str,
-    idea: IdeaOutput | None,
-    theme: str,
-    attempts: int,
-    error: str | None,
-) -> PipelineResult:
+        ctx.ledger.update_attempt(attempt_id, status=status)
+    progress.status, progress.error = status, None
     _emit(
         ctx,
-        "pipeline_finished",
-        "pipeline",
+        "validation_result",
+        "validation",
         pipeline_id,
-        None,
-        None,
-        None,
-        {"status": status, "attempts": attempts, "error": error, "theme": theme},
-    )
-    return PipelineResult(
-        pipeline_id=pipeline_id,
-        status=status,
-        idea_name=idea.name if idea else None,
-        theme=theme,
-        attempts=attempts,
+        idea_id,
+        progress.attempts,
+        "validation",
+        {"passed": verdict.passed},
     )
 
 
@@ -309,11 +391,9 @@ async def _check_attempt(
     code: CoderOutput,
     attempt_number: int,
 ) -> AttemptOutcome:
-    settings = ctx.settings
-    allowed = settings.sandbox.allowed_imports
     digest = code_hash(code.code)
     normalised = normalised_code_hash(code.code)
-    earlier = ctx.ledger.find_normalised_code(normalised)  # checked before this attempt is stored
+    earlier = ctx.ledger.find_normalised_code(normalised)  # looked up before this attempt is stored
     attempt_id = ctx.ledger.add_attempt(
         attempt_id=uuid.uuid4().hex,
         idea_id=idea_id,
@@ -324,6 +404,42 @@ async def _check_attempt(
         normalised_hash=normalised,
         status="running",
     )
+    checks = _AttemptChecks()
+    try:
+        return await _run_checks(
+            ctx,
+            pipeline_id,
+            idea_id,
+            idea,
+            code,
+            attempt_number,
+            attempt_id,
+            digest,
+            earlier,
+            checks,
+        )
+    except BudgetExceeded as exc:
+        _abort(ctx, attempt_id, "aborted_budget", str(exc), checks)
+        raise
+    except BaseException as exc:  # includes cancellation: no attempt stays 'running'
+        _abort(ctx, attempt_id, "aborted_error", f"{type(exc).__name__}: {exc}", checks)
+        raise
+
+
+async def _run_checks(
+    ctx: PipelineContext,
+    pipeline_id: str,
+    idea_id: str,
+    idea: IdeaOutput,
+    code: CoderOutput,
+    attempt_number: int,
+    attempt_id: str,
+    digest: str,
+    earlier: Any,
+    checks: _AttemptChecks,
+) -> AttemptOutcome:
+    settings = ctx.settings
+    allowed = settings.sandbox.allowed_imports
 
     def emit(event_type: str, stage: str, payload: dict, agent: str | None = None) -> None:
         _emit(ctx, event_type, stage, pipeline_id, idea_id, attempt_number, agent, payload)
@@ -337,11 +453,15 @@ async def _check_attempt(
 
     if earlier is not None:
         failure = (
-            "Duplicate code: this is the same program as an earlier attempt, apart from comments "
-            "and formatting. Write a genuinely different implementation."
+            "Duplicate code: this is the same program as an earlier attempt, apart from comments, "
+            "docstrings and formatting. Write a genuinely different implementation."
         )
-        emit("static_check", "static", {"ok": False, "errors": [failure], "warnings": []})
-        return _record(ctx, attempt_id, "rejected_duplicate_code", failure, None, static_ok=False)
+        emit(
+            "duplicate_code",
+            "static",
+            {"earlier_attempt_id": earlier["attempt_id"], "message": failure},
+        )
+        return _record(ctx, attempt_id, "rejected_duplicate_code", failure, None, static_ok=None)
 
     report = static_check(code.code, allowed)
     emit(
@@ -352,6 +472,7 @@ async def _check_attempt(
     if not report.ok:
         failure = "Static check failed:\n- " + "\n- ".join(report.errors)
         return _record(ctx, attempt_id, "failed_static", failure, None, static_ok=False)
+    checks.static_ok = True
 
     sandboxed = SandboxedSignal(code.code, settings.sandbox.timeout_seconds, allowed)
     ctx.ledger.add_trial(uuid.uuid4().hex, ctx.run_id, attempt_id, digest)
@@ -368,6 +489,7 @@ async def _check_attempt(
         return _record(
             ctx, attempt_id, "failed_sandbox", failure, None, static_ok=True, sandbox_ok=False
         )
+    checks.sandbox_ok = True
 
     try:
         results: list[LookaheadResult] = await asyncio.to_thread(
@@ -376,7 +498,7 @@ async def _check_attempt(
     except SandboxFailure as exc:
         failure = f"Lookahead tests could not run: {exc}"
         return _record(
-            ctx, attempt_id, "failed_sandbox", failure, None, static_ok=True, sandbox_ok=True
+            ctx, attempt_id, "failed_sandbox", failure, None, static_ok=True, sandbox_ok=False
         )
 
     for result in results:
@@ -409,33 +531,52 @@ async def _check_attempt(
             sandbox_ok=True,
             lookahead_ok=False,
         )
+    checks.lookahead_ok = True
 
-    result = run_backtest(
-        hold_weights(outcome.weights, idea.expected_holding_period_days),
-        ctx.train_prices,
-        settings.dates.start,
-        settings.dates.train_end,
-        settings.backtest,
-    )
+    held = hold_weights(outcome.weights, idea.expected_holding_period_days)
+    try:
+        result = run_backtest(
+            held,
+            ctx.train_prices,
+            settings.dates.start,
+            settings.dates.train_end,
+            settings.backtest,
+        )
+    except BacktestDataError as exc:
+        failure = f"The training backtest could not score the signal: {exc}"
+        return _record(
+            ctx,
+            attempt_id,
+            "failed_backtest",
+            failure,
+            None,
+            static_ok=True,
+            sandbox_ok=True,
+            lookahead_ok=True,
+        )
     metrics = {k: float(v) for k, v in asdict(result.metrics).items()}
+    checks.metrics = metrics
     ctx.ledger.update_attempt(
         attempt_id,
-        train_returns_json=json.dumps(
+        train_returns_json=strict_json(
             {str(day.date()): float(v) for day, v in result.net_returns.items()}
         ),
     )
     emit("train_backtest", "train", metrics)
 
     gates = settings.gates
-    problems = []
-    if not metrics["sharpe"] >= gates.min_train_sharpe:
+    problems: list[str] = []
+    sharpe = metrics["sharpe"]
+    if not math.isfinite(sharpe):
+        problems.append("Sharpe is not a finite number, because the scoring window has no variance")
+    elif sharpe < gates.min_train_sharpe:
+        problems.append(f"Sharpe {sharpe:.3f} is below the minimum {gates.min_train_sharpe}")
+    turnover = metrics["avg_daily_turnover"]
+    if not math.isfinite(turnover):
+        problems.append("average daily turnover is not a finite number")
+    elif turnover > gates.max_turnover_daily:
         problems.append(
-            f"Sharpe {metrics['sharpe']:.3f} is below the minimum {gates.min_train_sharpe}"
-        )
-    if not metrics["avg_daily_turnover"] <= gates.max_turnover_daily:
-        problems.append(
-            f"average daily turnover {metrics['avg_daily_turnover']:.3f} is above the limit "
-            f"{gates.max_turnover_daily}"
+            f"average daily turnover {turnover:.3f} is above the limit {gates.max_turnover_daily}"
         )
     if problems:
         failure = "Training gate failed: " + "; ".join(problems) + "."
@@ -450,17 +591,30 @@ async def _check_attempt(
             lookahead_ok=True,
         )
 
-    critic = await critique_signal(
-        ctx.llm,
-        prompt=ctx.critic_prompt,
-        model=settings.agents.critic_model,
-        idea_name=idea.name,
-        hypothesis=idea.hypothesis,
-        code=code.code,
-        metrics=metrics,
-        pipeline_id=pipeline_id,
-        idea_id=idea_id,
-    )
+    try:
+        critic = await critique_signal(
+            ctx.llm,
+            prompt=ctx.critic_prompt,
+            model=settings.agents.critic_model,
+            idea_name=idea.name,
+            hypothesis=idea.hypothesis,
+            code=code.code,
+            metrics=metrics,
+            pipeline_id=pipeline_id,
+            idea_id=idea_id,
+        )
+    except (StepFailed, ContextLimitExceeded) as exc:
+        failure = f"The critic gave no usable review: {exc}"
+        return _record(
+            ctx,
+            attempt_id,
+            "failed_critic_output",
+            failure,
+            metrics,
+            static_ok=True,
+            sandbox_ok=True,
+            lookahead_ok=True,
+        )
     emit(
         "critic_review",
         "critic",
@@ -514,23 +668,48 @@ def _record(
     failure: str | None,
     metrics: dict[str, Any] | None,
     *,
-    static_ok: bool,
+    static_ok: bool | None,
     sandbox_ok: bool | None = None,
     lookahead_ok: bool | None = None,
     critic: CriticOutput | None = None,
 ) -> AttemptOutcome:
+    """Write an attempt's final status. None means the check never ran, so the column stays NULL."""
     ctx.ledger.update_attempt(
         attempt_id,
         status=status,
-        static_ok=int(static_ok),
-        sandbox_ok=None if sandbox_ok is None else int(sandbox_ok),
-        lookahead_ok=None if lookahead_ok is None else int(lookahead_ok),
+        static_ok=_flag(static_ok),
+        sandbox_ok=_flag(sandbox_ok),
+        lookahead_ok=_flag(lookahead_ok),
         error=failure,
-        train_metrics_json=None if metrics is None else json.dumps(metrics),
+        train_metrics_json=None if metrics is None else strict_json(metrics),
     )
     return AttemptOutcome(
         status=status, failure=failure, metrics=metrics, critic=critic, attempt_id=attempt_id
     )
+
+
+def _abort(
+    ctx: PipelineContext,
+    attempt_id: str,
+    status: str,
+    error: str,
+    checks: _AttemptChecks,
+) -> None:
+    """Record what an attempt reached before an exception stopped it, so no row stays 'running'."""
+    fields: dict[str, Any] = {"status": status, "error": error}
+    if checks.static_ok is not None:
+        fields["static_ok"] = int(checks.static_ok)
+    if checks.sandbox_ok is not None:
+        fields["sandbox_ok"] = int(checks.sandbox_ok)
+    if checks.lookahead_ok is not None:
+        fields["lookahead_ok"] = int(checks.lookahead_ok)
+    if checks.metrics is not None:
+        fields["train_metrics_json"] = strict_json(checks.metrics)
+    ctx.ledger.update_attempt(attempt_id, **fields)
+
+
+def _flag(value: bool | None) -> int | None:
+    return None if value is None else int(value)
 
 
 def _iso(value: pd.Timestamp | None) -> str | None:

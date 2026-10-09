@@ -22,10 +22,17 @@ class IdeaOutput(BaseModel):
     )
 
 
+# The coder's reply is one tool call and is capped at max_tokens_per_call (4,000 tokens in
+# settings.toml). Python is about 3 characters per token, so the budget holds about 12,000
+# characters. 10,000 leaves room for the JSON wrapper and escapes. A longer cap would only let
+# the model write code that is cut off at max_tokens.
+CODER_CODE_MAX_CHARS = 10_000
+
+
 class CoderOutput(BaseModel):
     code: str = Field(
         min_length=20,
-        max_length=20_000,
+        max_length=CODER_CODE_MAX_CHARS,
         description="Full Python source. It must define signal(prices) and nothing else needs to run.",
     )
 

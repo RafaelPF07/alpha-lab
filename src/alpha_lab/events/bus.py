@@ -1,7 +1,8 @@
 """Typed pipeline events: persisted to the ledger and broadcast to live subscribers.
 
 Emitting must never crash or noticeably slow the pipeline. Failures are logged
-to stderr and dropped. Holdout data must never appear in a payload.
+to stderr and dropped. Holdout data must never appear in a payload. A payload is
+strict JSON: NaN and infinity become null when the event is built.
 """
 
 from __future__ import annotations
@@ -12,9 +13,9 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from alpha_lab.ledger.db import Ledger
+from alpha_lab.ledger.db import Ledger, json_ready
 
 EventType = Literal[
     "run_started",
@@ -22,8 +23,10 @@ EventType = Literal[
     "idea_created",
     "idea_rejected_duplicate",
     "llm_call_started",
+    "llm_call_refused",
     "llm_call_finished",
     "code_written",
+    "duplicate_code",
     "static_check",
     "sandbox_run",
     "lookahead_check",
@@ -35,6 +38,9 @@ EventType = Literal[
     "budget_update",
     "run_finished",
 ]
+
+# The first dropped event is reported, then one report per this many, so a full queue cannot flood stderr.
+DROP_REPORT_EVERY = 1000
 
 
 def _now_ms() -> datetime:
@@ -54,17 +60,29 @@ class PipelineEvent(BaseModel):
     timestamp: datetime = Field(default_factory=_now_ms)
     payload: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("payload", mode="after")
+    @classmethod
+    def _strict_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        """NaN and infinity become null here, so no subscriber and no ledger row ever sees them."""
+        return json_ready(payload)
+
 
 class EventBus:
     def __init__(self, ledger: Ledger, queue_size: int = 10_000) -> None:
         self._ledger = ledger
         self._queue_size = queue_size
         self._subscribers: list[asyncio.Queue[PipelineEvent]] = []
+        self._dropped = 0
 
     def subscribe(self) -> asyncio.Queue[PipelineEvent]:
         queue: asyncio.Queue[PipelineEvent] = asyncio.Queue(maxsize=self._queue_size)
         self._subscribers.append(queue)
         return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[PipelineEvent]) -> None:
+        """Stop sending events to this queue. Events emitted from now on are not queued for it."""
+        if queue in self._subscribers:
+            self._subscribers.remove(queue)
 
     def emit(self, event: PipelineEvent) -> None:
         try:
@@ -86,4 +104,10 @@ class EventBus:
             try:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
-                print(f"[events] subscriber queue full, dropped {event.type}", file=sys.stderr)
+                self._dropped += 1
+                if self._dropped % DROP_REPORT_EVERY == 1:
+                    print(
+                        f"[events] subscriber queue full: {self._dropped} events dropped so far, "
+                        f"latest {event.type}",
+                        file=sys.stderr,
+                    )

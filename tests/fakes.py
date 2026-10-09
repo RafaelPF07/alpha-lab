@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,6 +16,7 @@ def tool_response(
     cache_read: int = 0,
     cache_write: int = 0,
     tool_id: str = "toolu_test",
+    stop_reason: str = "tool_use",
 ) -> SimpleNamespace:
     block = SimpleNamespace(type="tool_use", id=tool_id, name=name, input=tool_input)
     block.model_dump = lambda exclude_none=False: {  # mirrors the SDK block model
@@ -29,7 +31,20 @@ def tool_response(
         cache_read_input_tokens=cache_read,
         cache_creation_input_tokens=cache_write,
     )
-    return SimpleNamespace(content=[block], usage=usage, stop_reason="tool_use")
+    return SimpleNamespace(content=[block], usage=usage, stop_reason=stop_reason)
+
+
+def text_response(text: str = "Here is my answer in prose.") -> SimpleNamespace:
+    """A reply with no tool call, which is what a model returns when it ignores the tool."""
+    block = SimpleNamespace(type="text", text=text)
+    block.model_dump = lambda exclude_none=False: {"type": "text", "text": text}
+    usage = SimpleNamespace(
+        input_tokens=1000,
+        output_tokens=50,
+        cache_read_input_tokens=0,
+        cache_creation_input_tokens=0,
+    )
+    return SimpleNamespace(content=[block], usage=usage, stop_reason="end_turn")
 
 
 class _Messages:
@@ -59,15 +74,22 @@ class RoutingAnthropic:
     new, unique idea, so swarms never accidentally produce duplicates unless a test asks.
     """
 
-    def __init__(self, scripts: dict[str, list[Any]], idea_factory: Any = None) -> None:
+    def __init__(
+        self, scripts: dict[str, list[Any]], idea_factory: Any = None, yield_once: bool = False
+    ) -> None:
         self._scripts = {k: list(v) for k, v in scripts.items()}
         self._idea_factory = idea_factory
         self._counter = 0
+        # yield_once makes each call suspend once before it answers, as a real network call does.
+        # Without it, a pipeline runs to its next real suspension point without any interleaving.
+        self._yield_once = yield_once
         self.calls: list[dict[str, Any]] = []
         self.messages = self
 
     async def create(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
+        if self._yield_once:
+            await asyncio.sleep(0)
         tool = kwargs["tools"][0]["name"]
         queue = self._scripts.get(tool, [])
         if queue:
