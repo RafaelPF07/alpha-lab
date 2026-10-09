@@ -1,11 +1,16 @@
-"""Command line interface: `lab data`, `lab backtest`, `lab run`, `lab ledger`."""
+"""Command line interface: `lab data`, `lab backtest`, `lab run`, `lab ledger`, `lab holdout`."""
 
 from __future__ import annotations
 
 import asyncio
+import getpass
 import json
 import logging
 import os
+import re
+import secrets
+import sqlite3
+import sys
 import uuid
 
 import anthropic
@@ -13,10 +18,12 @@ import pandas as pd
 import typer
 
 from alpha_lab.backtest.engine import run_backtest
-from alpha_lab.config import DATA_DIR, load_env_file, load_settings, load_universe
+from alpha_lab.config import DATA_DIR, PROJECT_ROOT, load_env_file, load_settings, load_universe
 from alpha_lab.data.loader import (
     PRE_HOLDOUT_FILE,
+    CacheMismatch,
     YFinanceSource,
+    check_fingerprint,
     fetch_and_cache,
     format_quality_summary,
     load_prices,
@@ -36,6 +43,36 @@ app.add_typer(data_app, name="data")
 app.add_typer(ledger_app, name="ledger")
 
 BACKTEST_SPLITS = ("train", "validation")
+# Tests point these at temporary paths. Every command reads them at call time.
+RUNS_DIR = PROJECT_ROOT / "runs"
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _open_ledger() -> Ledger:
+    return Ledger(LEDGER_PATH)
+
+
+def _plain(text: str | None) -> str:
+    """Remove control characters from agent-written text before it reaches a terminal."""
+    return _CONTROL_CHARS.sub("", text or "")
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _current_user() -> str:
+    try:
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001 - the audit field is best effort
+        return "unknown"
+
+
+def _confirmation_code() -> str:
+    return secrets.token_hex(2).upper()
 
 
 @data_app.command("fetch")
@@ -49,6 +86,11 @@ def data_fetch(
     if refresh or not (DATA_DIR / PRE_HOLDOUT_FILE).exists():
         report = fetch_and_cache(settings, universe, YFinanceSource(), DATA_DIR)
     else:
+        try:
+            check_fingerprint(settings, universe, DATA_DIR)
+        except CacheMismatch as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(1) from None
         typer.echo("Cache found. Use --refresh to re-download.")
         report = read_report(DATA_DIR)
     typer.echo(format_quality_summary(report))
@@ -84,7 +126,11 @@ def backtest(
 
     settings = load_settings()
     universe = load_universe()
-    prices = load_prices(settings, universe)
+    try:
+        prices = load_prices(settings, universe)
+    except CacheMismatch as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
     lower, upper = split_window(settings.dates, split)
 
     visible = prices.loc[: pd.Timestamp(upper)]  # the signal may use history up to the window end
@@ -135,9 +181,13 @@ def run_command(
     settings = load_settings()
     universe = load_universe()
     budget_usd = settings.run.default_budget_usd if budget is None else budget
-    prices = load_prices(settings, universe)
+    try:
+        prices = load_prices(settings, universe)
+    except CacheMismatch as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
 
-    ledger = Ledger()
+    ledger = _open_ledger()
     bus = EventBus(ledger)
     queue = bus.subscribe()
     run_id = uuid.uuid4().hex[:12]
@@ -200,7 +250,7 @@ def ledger_show(
     code: bool = typer.Option(False, "--code", help="Print each attempt's code."),
 ) -> None:
     """List runs, or show one run's ideas, checks, metrics and LLM cost."""
-    ledger = Ledger()
+    ledger = _open_ledger()
     if run is None:
         rows = ledger.list_runs()
         if not rows:
@@ -225,16 +275,17 @@ def ledger_show(
     ideas = {i["idea_id"]: i for i in ledger.ideas_for_run(run)}
     for idea_id, idea in ideas.items():
         typer.echo("")
-        typer.echo(f"Idea: {idea['name']}")
-        typer.echo(f"  hypothesis: {idea['hypothesis']}")
-        typer.echo(f"  description: {idea['description']}")
+        typer.echo(f"Idea: {_plain(idea['name'])}")
+        typer.echo(f"  hypothesis: {_plain(idea['hypothesis'])}")
+        typer.echo(f"  description: {_plain(idea['description'])}")
         typer.echo(f"  holding period: {idea['expected_holding_period_days']} days")
         for attempt in ledger.attempts_for_run(run):
             if attempt["idea_id"] != idea_id:
                 continue
             typer.echo(f"  attempt {attempt['attempt_number']}: {attempt['status']}")
             if attempt["error"]:
-                typer.echo(f"    check: {attempt['error'].splitlines()[0][:200]}")
+                first = attempt["error"].splitlines()[0][:200]
+                typer.echo(f"    check: {_plain(first)}")
             if attempt["train_metrics_json"]:
                 m = json.loads(attempt["train_metrics_json"])
                 typer.echo(
@@ -244,7 +295,7 @@ def ledger_show(
             if code and attempt["code"]:
                 typer.echo("    code:")
                 for line in attempt["code"].splitlines():
-                    typer.echo(f"      {line}")
+                    typer.echo(f"      {_plain(line)}")
 
     typer.echo("")
     typer.echo("LLM cost by agent:")
@@ -262,7 +313,7 @@ def report_command(
     """Write the Markdown and HTML report for a run, with research figures."""
     from alpha_lab.ledger.report import write_report
 
-    ledger = Ledger()
+    ledger = _open_ledger()
     if run is None:
         rows = ledger.list_runs(1)
         if not rows:
@@ -272,7 +323,7 @@ def report_command(
     if ledger.get_run(run) is None:
         typer.echo(f"no run with id {run!r}", err=True)
         raise typer.Exit(1)
-    path = write_report(ledger, run)
+    path = write_report(ledger, run, out_dir=RUNS_DIR / run)
     typer.echo(f"Report written to {path} (and report.html, figures/ next to it).")
 
 
@@ -282,30 +333,54 @@ def holdout_command(
     top: int = typer.Option(
         5, "--top", min=1, help="How many signals, best deflated Sharpe first."
     ),
+    attempt: list[str] | None = typer.Option(  # noqa: B008 - typer's documented call-style default
+        None,
+        "--attempt",
+        help="Test only these attempt IDs (full IDs, repeatable). Ignores --top.",
+    ),
     i_understand_this_is_final: bool = typer.Option(
         False,
         "--i-understand-this-is-final",
-        help="Required. Each signal gets exactly one holdout run, ever.",
+        help="Required. Each idea gets exactly one holdout run, ever.",
     ),
 ) -> None:
-    """Run the one-time holdout test on the top validated signals. Human only."""
+    """Run the one-time holdout test on validated signals. Human only, in a terminal."""
     from alpha_lab.ledger.report import build_report_data
     from alpha_lab.pipeline.holdout import HoldoutCandidate, HoldoutRefused, run_holdout
 
     if not i_understand_this_is_final:
         typer.echo(
-            "Refusing to run. The holdout is final and can be run once per signal.\n"
+            "Refusing to run. The holdout is final and can be run once per idea.\n"
             "Re-run with --i-understand-this-is-final if you mean it.",
             err=True,
         )
         raise typer.Exit(2)
+    if not _stdin_is_tty():
+        typer.echo(
+            "Refusing to run: `lab holdout` needs an interactive terminal. It does not read a "
+            "piped or scripted confirmation.",
+            err=True,
+        )
+        raise typer.Exit(2)
 
-    ledger = Ledger()
+    ledger = _open_ledger()
     if ledger.get_run(run) is None:
         typer.echo(f"no run with id {run!r}", err=True)
         raise typer.Exit(1)
     data = build_report_data(ledger, run)
-    survivors = [c for c in data.candidates if c.passed][:top]
+    passed = [c for c in data.candidates if c.passed]
+    if attempt:
+        wanted = set(attempt)
+        survivors = [c for c in passed if c.attempt_id in wanted]
+        unknown = sorted(wanted - {c.attempt_id for c in survivors})
+        if unknown:
+            typer.echo(
+                f"no validated signal in run {run!r} has attempt id(s): {', '.join(unknown)}",
+                err=True,
+            )
+            raise typer.Exit(1)
+    else:
+        survivors = passed[:top]
     if not survivors:
         typer.echo("No validated signals in this run. Nothing to test.", err=True)
         raise typer.Exit(1)
@@ -313,52 +388,78 @@ def holdout_command(
     candidates = []
     for c in survivors:
         row = ledger.conn.execute(
-            "SELECT a.code, i.expected_holding_period_days AS hold FROM attempts a "
+            "SELECT a.code, a.idea_id, i.expected_holding_period_days AS hold FROM attempts a "
             "JOIN ideas i ON i.idea_id = a.idea_id WHERE a.attempt_id = ?",
             (c.attempt_id,),
         ).fetchone()
         candidates.append(
             HoldoutCandidate(
-                attempt_id=c.attempt_id, name=c.name, code=row["code"], holding_days=row["hold"]
+                attempt_id=c.attempt_id,
+                idea_id=row["idea_id"],
+                name=c.name,
+                code=row["code"],
+                holding_days=row["hold"],
             )
         )
 
-    def confirm(items: list) -> bool:
+    def confirm(items: list[HoldoutCandidate]) -> bool:
         typer.echo("About to run the holdout, once, on these signals:")
         for item in items:
-            typer.echo(f"  - {item.name} ({item.attempt_id[:8]})")
-        return typer.confirm(
-            "This uses the holdout period and cannot be undone. Continue?", default=False
+            typer.echo(f"  - {_plain(item.name)}  attempt {item.attempt_id}")
+        code = _confirmation_code()
+        typed = typer.prompt(
+            f"This downloads the holdout period and cannot be undone. Type {code} to continue"
         )
+        return typed.strip().upper() == code
 
     settings = load_settings()
+    universe = load_universe()
+    invocation = {
+        "argv": sys.argv,
+        "user": _current_user(),
+        "pid": os.getpid(),
+        "stdin_is_tty": True,
+        "run_id": run,
+    }
     try:
         results = run_holdout(
             ledger=ledger,
             run_id=run,
             settings=settings,
+            universe=universe,
             candidates=candidates,
-            i_understand_this_is_final=True,
+            i_understand_this_is_final=i_understand_this_is_final,
             confirm=confirm,
+            data_dir=DATA_DIR,
+            invocation=invocation,
         )
-    except HoldoutRefused as exc:
+    except (HoldoutRefused, CacheMismatch) as exc:
         typer.echo(f"Refused: {exc}", err=True)
+        raise typer.Exit(1) from None
+    except sqlite3.IntegrityError as exc:
+        typer.echo(f"Refused: the ledger rejected the holdout record ({exc}).", err=True)
         raise typer.Exit(1) from None
 
     by_id = {c.attempt_id: c for c in survivors}
+    failed = False
     for r in results:
         c = by_id[r.attempt_id]
-        typer.echo(f"{r.name}")
+        typer.echo(_plain(r.name))
         typer.echo(
-            f"  train SR {c.train_sharpe:.3f}   validation SR {c.validation_sharpe:.3f}   deflated SR {c.deflated_sharpe:.3f}"
+            f"  train SR {c.train_sharpe:.3f}   validation SR {c.validation_sharpe:.3f}   "
+            f"deflated SR {c.deflated_sharpe:.3f}"
         )
-        if r.metrics:
+        if r.status == "complete" and r.metrics:
             m = r.metrics
             typer.echo(
-                f"  holdout SR {m['sharpe']:.3f}   ann. return {m['ann_return']:+.2%}   max DD {m['max_drawdown']:.2%}"
+                f"  holdout SR {m['sharpe']:.3f}   ann. return {m['ann_return']:+.2%}   "
+                f"max DD {m['max_drawdown']:.2%}"
             )
         else:
-            typer.echo(f"  holdout status: {r.status} ({r.error})")
+            failed = failed or r.status == "error"
+            typer.echo(f"  holdout status: {r.status} ({_plain(r.error)})")
+    if failed:
+        raise typer.Exit(1)
 
 
 @app.command("dashboard")
@@ -370,7 +471,6 @@ def dashboard_command(
     """Serve the dashboard at http://localhost:8000."""
     import uvicorn
 
-    from alpha_lab.config import PROJECT_ROOT
     from alpha_lab.dashboard.server import create_app
 
     ledger_path = PROJECT_ROOT / "runs" / "demo.db" if demo else LEDGER_PATH

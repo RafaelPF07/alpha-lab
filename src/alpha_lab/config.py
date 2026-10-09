@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from datetime import date
 from pathlib import Path
@@ -129,16 +130,44 @@ class Universe(_Strict):
         return self
 
 
+_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
 def load_env_file(path: Path = PROJECT_ROOT / ".env") -> None:
-    """Load KEY=VALUE lines from .env into os.environ. Existing variables win. No dependency needed."""
+    """Load KEY=VALUE lines from a .env file into os.environ. Existing variables win.
+
+    Accepts a UTF-8 byte-order mark (Windows PowerShell writes one), an `export` prefix, quoted
+    values, and a ` # comment` after an unquoted value. A line that does not parse raises
+    ValueError with its line number. The line's value is never put in the message.
+    """
     if not path.exists():
         return
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    text = path.read_text(encoding="utf-8-sig")
+    for number, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        if not line or line.startswith("#"):
             continue
-        key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or not _ENV_KEY.match(key):
+            raise ValueError(f"{path.name} line {number}: expected KEY=VALUE")
+        value = value.strip()
+        if value[:1] in ("'", '"'):
+            quote = value[0]
+            end = value.find(quote, 1)
+            if end < 0:
+                raise ValueError(f"{path.name} line {number}: unterminated {quote} quote")
+            rest = value[end + 1 :].strip()
+            if rest and not rest.startswith("#"):
+                raise ValueError(f"{path.name} line {number}: text after the closing quote")
+            value = value[1:end]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+            if "'" in value or '"' in value:
+                raise ValueError(f"{path.name} line {number}: stray quote in an unquoted value")
+        os.environ.setdefault(key, value)
 
 
 def load_settings(path: Path = CONFIG_DIR / "settings.toml") -> Settings:

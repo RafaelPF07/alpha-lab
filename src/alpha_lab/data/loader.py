@@ -1,32 +1,39 @@
-"""Fetch, clean and cache daily adjusted closes.
+"""Fetch, clean and cache daily adjusted closes. The cache holds pre-holdout data only.
 
-Holdout rows go to their own Parquet file. The default reader never opens it,
-so ordinary code cannot see holdout prices by accident.
+The holdout window is never written to disk. pipeline/holdout.py downloads it in memory during
+`lab holdout`, and its SHA-256 goes into the ledger.
 
-Cleaning decisions that look at missingness use only the pre-holdout period,
-so a holdout-period gap cannot change which tickers are kept.
+A fingerprint file beside the cache records the tickers, dates and cleaning settings the cache
+was built with. load_prices refuses a cache whose fingerprint does not match the current settings.
+
+Cleaning decisions that look at missingness use only the pre-holdout period, so a holdout-period
+gap cannot change which tickers are kept.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import pandas as pd
 
 from alpha_lab.config import DATA_DIR, DataConfig, Dates, Settings, Universe
-from alpha_lab.data.splits import check_holdout_caller
 
 log = logging.getLogger(__name__)
 
 PRE_HOLDOUT_FILE = "prices_pre_holdout.parquet"
-HOLDOUT_FILE = "prices_holdout.parquet"
+FINGERPRINT_FILE = "cache_fingerprint.json"
 REPORT_FILE = "cleaning_report.json"
+
+
+class CacheMismatch(RuntimeError):
+    """The price cache has no fingerprint, or was built for different settings."""
 
 
 class PriceSource(Protocol):
@@ -77,13 +84,15 @@ class CleaningReport:
 def clean_prices(
     raw: pd.DataFrame, dates: Dates, data_cfg: DataConfig
 ) -> tuple[pd.DataFrame, dict[str, str]]:
-    """Drop badly-missing tickers, then forward-fill short gaps. Returns (cleaned, dropped)."""
+    """Drop badly-missing tickers, then forward-fill short gaps. Returns (cleaned, dropped).
+
+    Rows after validation_end are discarded here, so no holdout row can reach the cache.
+    """
     prices = raw.sort_index()
     prices = prices[~prices.index.duplicated(keep="first")]
-    prices = prices.loc[: pd.Timestamp(dates.holdout_end)]
+    prices = prices.loc[: pd.Timestamp(dates.validation_end)]
 
-    pre_holdout = prices[prices.index <= pd.Timestamp(dates.validation_end)]
-    missing = pre_holdout.isna().mean()
+    missing = prices.isna().mean()
 
     dropped: dict[str, str] = {}
     for ticker in prices.columns:
@@ -122,21 +131,59 @@ def find_return_flags(pre_holdout: pd.DataFrame, data_cfg: DataConfig) -> list[d
 
 
 def write_cache(prices: pd.DataFrame, dates: Dates, data_dir: Path) -> None:
+    """Write the pre-holdout rows (up to validation_end). Later rows are dropped, never written."""
     validation_end = pd.Timestamp(dates.validation_end)
     data_dir.mkdir(parents=True, exist_ok=True)
     prices[prices.index <= validation_end].to_parquet(data_dir / PRE_HOLDOUT_FILE)
-    prices[prices.index > validation_end].to_parquet(data_dir / HOLDOUT_FILE)
 
 
 def read_pre_holdout(data_dir: Path = DATA_DIR) -> pd.DataFrame:
-    """Prices from start through validation_end. Holdout is not included."""
+    """Prices from start through validation_end. No fingerprint check; see read_checked_pre_holdout."""
     return pd.read_parquet(data_dir / PRE_HOLDOUT_FILE)
 
 
-def read_holdout_cache(data_dir: Path = DATA_DIR) -> pd.DataFrame:
-    """Holdout-period prices. Only pipeline/holdout.py may call this."""
-    check_holdout_caller()
-    return pd.read_parquet(data_dir / HOLDOUT_FILE)
+def cache_fingerprint(settings: Settings, universe: Universe) -> dict[str, Any]:
+    """What the cache depends on: the tickers requested, the dates and the cleaning settings."""
+    return {
+        "tickers": list(universe.tickers),
+        "dates": settings.dates.model_dump(mode="json"),
+        "data": settings.data.model_dump(mode="json"),
+    }
+
+
+def _digest(fingerprint: dict[str, Any]) -> str:
+    text = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def write_fingerprint(settings: Settings, universe: Universe, data_dir: Path = DATA_DIR) -> None:
+    fingerprint = cache_fingerprint(settings, universe)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    body = {"sha256": _digest(fingerprint), "fingerprint": fingerprint}
+    (data_dir / FINGERPRINT_FILE).write_text(json.dumps(body, indent=2), encoding="utf-8")
+
+
+def check_fingerprint(settings: Settings, universe: Universe, data_dir: Path = DATA_DIR) -> None:
+    """Raise CacheMismatch unless the cache was built for exactly these settings."""
+    expected = _digest(cache_fingerprint(settings, universe))
+    try:
+        stored = json.loads((data_dir / FINGERPRINT_FILE).read_text(encoding="utf-8"))["sha256"]
+    except (OSError, ValueError, KeyError, TypeError):
+        stored = None
+    if stored != expected:
+        raise CacheMismatch(
+            f"The price cache in {data_dir} was built for different settings (tickers, dates "
+            "or cleaning rules), or it has no fingerprint. Run `lab data fetch --refresh` "
+            "to rebuild it."
+        )
+
+
+def read_checked_pre_holdout(
+    settings: Settings, universe: Universe, data_dir: Path = DATA_DIR
+) -> pd.DataFrame:
+    """Pre-holdout prices, but only if the cache matches the current settings."""
+    check_fingerprint(settings, universe, data_dir)
+    return read_pre_holdout(data_dir)
 
 
 def fetch_and_cache(
@@ -146,13 +193,15 @@ def fetch_and_cache(
     data_dir: Path = DATA_DIR,
 ) -> CleaningReport:
     dates = settings.dates
+    # Requested only up to validation_end. The holdout window is never fetched here.
     raw = source.fetch_adjusted_close(
         universe.tickers,
         dates.start,
-        dates.holdout_end + timedelta(days=1),
+        dates.validation_end + timedelta(days=1),
     )
     cleaned, dropped = clean_prices(raw, dates, settings.data)
     write_cache(cleaned, dates, data_dir)
+    write_fingerprint(settings, universe, data_dir)
 
     pre = cleaned[cleaned.index <= pd.Timestamp(dates.validation_end)]
     report = CleaningReport(
@@ -180,10 +229,13 @@ def load_prices(
     source: PriceSource | None = None,
     data_dir: Path = DATA_DIR,
 ) -> pd.DataFrame:
-    """Pre-holdout prices, fetching first if the cache is missing or `refresh` is set."""
+    """Pre-holdout prices, fetching first if the cache is missing or `refresh` is set.
+
+    Raises CacheMismatch if the cache was built for other settings.
+    """
     if refresh or not (data_dir / PRE_HOLDOUT_FILE).exists():
         fetch_and_cache(settings, universe, source or YFinanceSource(), data_dir)
-    return read_pre_holdout(data_dir)
+    return read_checked_pre_holdout(settings, universe, data_dir)
 
 
 def format_quality_summary(report: CleaningReport) -> str:

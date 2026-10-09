@@ -1,16 +1,29 @@
-"""Cleaning rules, tested on synthetic data so no network is needed."""
+"""Cleaning rules, the cache and its fingerprint. Synthetic data only, so no network is needed."""
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from alpha_lab.config import load_settings
-from alpha_lab.data.loader import clean_prices, find_return_flags, read_pre_holdout, write_cache
+from alpha_lab.config import load_settings, load_universe
+from alpha_lab.data.loader import (
+    CacheMismatch,
+    clean_prices,
+    find_return_flags,
+    load_prices,
+    read_pre_holdout,
+    write_cache,
+    write_fingerprint,
+)
 
 
 @pytest.fixture
 def settings():
     return load_settings()
+
+
+@pytest.fixture
+def universe():
+    return load_universe()
 
 
 @pytest.fixture
@@ -69,10 +82,43 @@ def test_large_moves_are_flagged_not_deleted(settings, synthetic_raw):
     assert cleaned["SPIKE"].iloc[100] == pytest.approx(synthetic_raw["SPIKE"].iloc[100])
 
 
-def test_cache_splits_holdout_away_from_default_reader(settings, synthetic_raw, tmp_path):
+def test_cleaning_discards_every_row_after_validation_end(settings, synthetic_raw):
     cleaned, _ = clean_prices(synthetic_raw, settings.dates, settings.data)
-    write_cache(cleaned, settings.dates, tmp_path)
+    assert cleaned.index.max() <= pd.Timestamp(settings.dates.validation_end)
+    assert len(cleaned) < len(synthetic_raw)
 
+
+def test_write_cache_keeps_holdout_rows_off_disk(settings, synthetic_raw, tmp_path):
+    # Pass the full frame on purpose. write_cache must still drop the holdout rows.
+    write_cache(synthetic_raw.loc[:, ["GOOD"]], settings.dates, tmp_path)
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["prices_pre_holdout.parquet"]
     pre = read_pre_holdout(tmp_path)
     assert pre.index.max() <= pd.Timestamp(settings.dates.validation_end)
-    assert len(pre) < len(cleaned)
+
+
+def test_load_prices_refuses_a_cache_built_for_other_settings(settings, universe, tmp_path):
+    index = pd.bdate_range(settings.dates.start, settings.dates.validation_end)
+    write_cache(pd.DataFrame(1.0, index=index, columns=["AAA"]), settings.dates, tmp_path)
+    other = universe.model_copy(update={"stocks": [*universe.stocks, "ZZZZ"]})
+    write_fingerprint(settings, other, tmp_path)
+
+    with pytest.raises(CacheMismatch, match="lab data fetch --refresh"):
+        load_prices(settings, universe, data_dir=tmp_path)
+
+
+def test_load_prices_refuses_a_cache_with_no_fingerprint(settings, universe, tmp_path):
+    index = pd.bdate_range(settings.dates.start, settings.dates.validation_end)
+    write_cache(pd.DataFrame(1.0, index=index, columns=["AAA"]), settings.dates, tmp_path)
+
+    with pytest.raises(CacheMismatch, match="lab data fetch --refresh"):
+        load_prices(settings, universe, data_dir=tmp_path)
+
+
+def test_load_prices_accepts_a_cache_that_matches_the_settings(settings, universe, tmp_path):
+    index = pd.bdate_range(settings.dates.start, settings.dates.validation_end)
+    write_cache(pd.DataFrame(1.0, index=index, columns=["AAA"]), settings.dates, tmp_path)
+    write_fingerprint(settings, universe, tmp_path)
+
+    loaded = load_prices(settings, universe, data_dir=tmp_path)
+    assert list(loaded.columns) == ["AAA"]
