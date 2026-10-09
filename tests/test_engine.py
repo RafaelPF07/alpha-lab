@@ -1,5 +1,8 @@
 """Hand-computed backtest cases. Expected values are worked out in the comments, not taken from the code."""
 
+import inspect
+import math
+import warnings
 from datetime import date
 
 import numpy as np
@@ -8,10 +11,10 @@ import pytest
 
 from alpha_lab.backtest.engine import BacktestDataError, run_backtest, scale_to_gross
 from alpha_lab.backtest.holding import hold_weights
-from alpha_lab.checks.lookahead import run_lookahead_tests
+from alpha_lab.checks.lookahead import perturbation_test, run_lookahead_tests, truncation_test
 from alpha_lab.config import BacktestConfig, Dates
 from alpha_lab.data.splits import split_window
-from alpha_lab.signals.baselines import momentum_12_1, reversal_5d
+from alpha_lab.signals.baselines import equal_weight_long, momentum_12_1, reversal_5d
 
 DAYS = pd.bdate_range("2020-01-06", periods=10)
 COLS = ["A", "B", "C"]
@@ -123,9 +126,10 @@ def test_min_history_days_are_dropped_from_output():
 
 
 def test_nan_price_inside_window_raises():
+    # B is held, so a NaN on its price cannot be scored as no return.
     prices = frame([[100, 100, 100]] * 10)
     prices.loc[DAYS[5], "B"] = float("nan")
-    weights = frame([[0.0, 0.0, 0.0]] * 10)
+    weights = frame([[0.0, 1.0, 0.0]] * 10)
 
     with pytest.raises(ValueError, match="NaN"):
         run_backtest(weights, prices, DAYS[1].date(), DAYS[-1].date(), cfg())
@@ -148,7 +152,7 @@ def test_nan_on_the_day_before_the_window_raises():
     # scored silently as a zero return.
     prices = frame([[100, 100, 100]] * 10)
     prices.loc[DAYS[0], "B"] = float("nan")
-    weights = frame([[0.0, 0.0, 0.0]] * 10)
+    weights = frame([[0.0, 1.0, 0.0]] * 10)  # B is held into the window
 
     with pytest.raises(BacktestDataError, match="NaN"):
         run_backtest(weights, prices, DAYS[1].date(), DAYS[-1].date(), cfg())
@@ -172,15 +176,83 @@ def test_window_that_starts_before_the_first_price_raises():
         run_backtest(weights, prices, too_early, DAYS[-1].date(), cfg())
 
 
-def test_a_few_days_of_slack_at_the_window_edges_is_allowed():
-    # Weekends and market holidays: a window may end up to a week after the last price.
+def test_six_days_of_slack_at_both_window_edges_is_allowed():
+    # Weekends and market holidays: a window may end up to a week past the first or last price.
     prices = frame([[100, 100, 100]] * 10)
     weights = frame([[0.0, 0.0, 0.0]] * 10)
-    slack_end = (DAYS[-1] + pd.Timedelta(days=3)).date()
+    slack_end = (DAYS[-1] + pd.Timedelta(days=6)).date()
+    slack_start = (DAYS[0] - pd.Timedelta(days=6)).date()
 
-    result = run_backtest(weights, prices, DAYS[1].date(), slack_end, cfg())
+    assert len(run_backtest(weights, prices, DAYS[1].date(), slack_end, cfg()).net_returns) == 9
+    assert len(run_backtest(weights, prices, slack_start, DAYS[-1].date(), cfg()).net_returns) == 9
 
-    assert len(result.net_returns) == 9
+
+@pytest.mark.parametrize("overflow_days", [8, 14])
+def test_overflow_past_the_window_tolerance_raises_at_either_edge(overflow_days):
+    # R3-QA-05(d). The tolerance is 7 days, so 8 days past either edge must raise. (A tolerance of
+    # 14 days would let a 14-day overflow through, which is what the tests below catch.)
+    prices = frame([[100, 100, 100]] * 10)
+    weights = frame([[0.0, 0.0, 0.0]] * 10)
+    too_late = (DAYS[-1] + pd.Timedelta(days=overflow_days)).date()
+    too_early = (DAYS[0] - pd.Timedelta(days=overflow_days)).date()
+
+    with pytest.raises(BacktestDataError, match="end"):
+        run_backtest(weights, prices, DAYS[1].date(), too_late, cfg())
+    with pytest.raises(BacktestDataError, match="start"):
+        run_backtest(weights, prices, too_early, DAYS[-1].date(), cfg())
+
+
+def test_window_tolerance_is_seven_calendar_days():
+    from alpha_lab.backtest.engine import WINDOW_TOLERANCE_DAYS
+
+    assert WINDOW_TOLERANCE_DAYS == 7
+
+
+def _weekday_index_with_block_removed(n: int, start: int, count: int) -> pd.DatetimeIndex:
+    full = pd.bdate_range("2020-01-06", periods=n)
+    keep = np.ones(n, dtype=bool)
+    keep[start : start + count] = False
+    return full[keep]
+
+
+@pytest.mark.parametrize("count", [5, 6])
+def test_a_gap_of_more_than_four_weekdays_raises(count):
+    # R3-STAT-05, R4-STAT-03. A is about to jump 50% after the gap, and a return across the gap would
+    # book the whole move as one day, so the engine must refuse the prices. Five weekdays is the first
+    # size over the limit, so it is tested as well as six (the boundary is pinned).
+    index = _weekday_index_with_block_removed(30, start=10, count=count)
+    prices = pd.DataFrame(100.0, index=index, columns=COLS)
+    prices.iloc[10:, 0] = 150.0
+    weights = pd.DataFrame(0.0, index=index, columns=COLS)
+    weights.iloc[:, 0] = 1.0
+
+    with pytest.raises(BacktestDataError, match="gap"):
+        run_backtest(weights, prices, index[0].date(), index[-1].date(), cfg())
+
+
+def test_a_gap_before_the_window_does_not_refuse_the_window():
+    # R4-STAT-06. A six-weekday gap ends before the window starts. No return in the window touches it,
+    # so the window is scored. Before the fix the whole cache was checked and the window was refused.
+    index = _weekday_index_with_block_removed(30, start=2, count=6)
+    prices = pd.DataFrame(100.0, index=index, columns=COLS)
+    weights = pd.DataFrame(0.0, index=index, columns=COLS)
+    window_start = index[9]
+
+    result = run_backtest(weights, prices, window_start.date(), index[-1].date(), cfg())
+
+    assert len(result.net_returns) == int((index >= window_start).sum())
+
+
+@pytest.mark.parametrize("count", [1, 4])
+def test_a_gap_of_up_to_four_weekdays_is_accepted(count):
+    # A holiday looks the same as a missing day without a trading calendar, so short gaps pass.
+    index = _weekday_index_with_block_removed(30, start=10, count=count)
+    prices = pd.DataFrame(100.0, index=index, columns=COLS)
+    weights = pd.DataFrame(0.0, index=index, columns=COLS)
+
+    result = run_backtest(weights, prices, index[0].date(), index[-1].date(), cfg())
+
+    assert len(result.net_returns) == len(index) - 1
 
 
 def test_window_with_fewer_than_two_scored_days_raises():
@@ -191,9 +263,10 @@ def test_window_with_fewer_than_two_scored_days_raises():
         run_backtest(weights, prices, DAYS[5].date(), DAYS[5].date(), cfg())
 
 
-def test_net_returns_before_a_cutoff_do_not_depend_on_later_prices():
+@pytest.mark.parametrize("signal", [momentum_12_1, reversal_5d, equal_weight_long])
+def test_net_returns_before_a_cutoff_do_not_depend_on_later_prices(signal):
     # End to end: signal, then holding, then engine. Scrambling prices after the cutoff
-    # must not move any net return up to and including the cutoff.
+    # must not move any net return up to and including the cutoff. STAT-14: three signals, not one.
     rng = np.random.default_rng(11)
     index = pd.bdate_range("2015-01-01", periods=420)
     cols = [f"T{i}" for i in range(6)]
@@ -208,7 +281,7 @@ def test_net_returns_before_a_cutoff_do_not_depend_on_later_prices():
     )
 
     def net(px: pd.DataFrame) -> pd.Series:
-        held = hold_weights(momentum_12_1(px), 21)
+        held = hold_weights(signal(px), 21)
         return run_backtest(held, px, index[1].date(), index[-1].date(), cfg()).net_returns
 
     base, changed = net(prices), net(perturbed)
@@ -234,19 +307,46 @@ def late_leak_from(leak_from: pd.Timestamp):
     return signal
 
 
-def test_lookahead_tests_see_a_leak_in_the_last_tenth_of_the_rows():
-    # Row 368 of 400 is 92%. The old cutoffs stopped at 90% (row 360), so nothing compared the leak.
-    rng = np.random.default_rng(3)
+def _random_prices(seed: int) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
     index = pd.bdate_range("2019-01-01", periods=400)
-    prices = pd.DataFrame(
+    return pd.DataFrame(
         100 * np.exp(np.cumsum(rng.normal(0.0003, 0.012, (400, 10)), axis=0)),
         index=index,
         columns=[f"T{i}" for i in range(10)],
     )
 
-    results = run_lookahead_tests(late_leak_from(index[368]), prices)
+
+def test_lookahead_tests_see_a_leak_in_the_last_tenth_of_the_rows():
+    # Row 368 of 400 is 92%. The old cutoffs stopped at 90% (row 360), so nothing compared the leak.
+    prices = _random_prices(3)
+
+    results = run_lookahead_tests(late_leak_from(prices.index[368]), prices)
 
     assert not all(r.passed for r in results), results
+
+
+@pytest.mark.parametrize("seed", [3, 11, 19, 27, 35])
+def test_truncation_catches_a_late_leak_for_every_price_seed(seed):
+    # STAT-14: one seed was not enough. The cutoff at row 380 (95%) sees the leak on row 380 for any
+    # prices, so the truncation test must fail for each seed, not only for the one above.
+    prices = _random_prices(seed)
+
+    assert not truncation_test(late_leak_from(prices.index[368]), prices).passed
+
+
+def test_default_cutoff_count_is_five():
+    # R3-QA-05(c): the number of cutoffs is part of the test's power, so pin the default.
+    for test in (truncation_test, perturbation_test):
+        assert inspect.signature(test).parameters["n_cutoffs"].default == 5
+
+
+@pytest.mark.parametrize("signal", [momentum_12_1, reversal_5d, equal_weight_long])
+@pytest.mark.parametrize("seed", [3, 11, 19])
+def test_baselines_pass_both_lookahead_tests_for_several_seeds(signal, seed):
+    results = run_lookahead_tests(signal, _random_prices(seed))
+
+    assert all(r.passed for r in results), results
 
 
 def test_reversal_buys_losers_and_momentum_buys_winners():
@@ -266,3 +366,160 @@ def test_reversal_buys_losers_and_momentum_buys_winners():
     path = 100.0 * np.exp(np.arange(260)[:, None] * drift[None, :])
     momentum = momentum_12_1(pd.DataFrame(path, index=days, columns=cols)).iloc[-1]
     assert momentum["T0"] > 0 > momentum["T4"]
+
+
+def test_nan_on_a_zero_weight_column_scores_as_no_return():
+    # Coordinator request (R4-F3). A ticker that is flat across a gap is not exposed to it, so a
+    # validation-only or holdout-only gap must not fail the window. Its NaN returns earn nothing.
+    weights = frame([[0.5, 0.0, 0.5]] * 10)
+    gapped = frame([[100, 100, 100]] * 10)
+    gapped.loc[DAYS[5:8], "B"] = float("nan")
+    filled = gapped.copy()
+    filled["B"] = 100.0
+
+    with_gap = run_backtest(weights, gapped, DAYS[1].date(), DAYS[-1].date(), cfg())
+    no_gap = run_backtest(weights, filled, DAYS[1].date(), DAYS[-1].date(), cfg())
+
+    pd.testing.assert_series_equal(with_gap.net_returns, no_gap.net_returns)
+
+
+def test_nan_on_a_column_that_is_exited_on_the_gap_still_raises():
+    # R4-STAT-02. B is held through day 3 and its position is zero from day 4 on. Day 5 is the NaN
+    # day: flat today, but held yesterday, so the sale on day 4 would trade across the NaN. The
+    # engine must refuse it. The check that looks only at today would score this without error.
+    prices = frame([[100, 100, 100]] * 10)
+    prices.loc[DAYS[5], "B"] = float("nan")
+    weights = frame([[0.0, 0.0, 0.0]] * 10)
+    weights.loc[DAYS[:4], "B"] = 1.0  # positions are these shifted one day: held on days 1 to 4
+
+    with pytest.raises(BacktestDataError, match="NaN"):
+        run_backtest(weights, prices, DAYS[1].date(), DAYS[-1].date(), cfg())
+
+
+def test_nan_on_a_column_that_is_held_on_the_gap_still_raises():
+    # The held-today case, kept as the second half of R4-STAT-02: B is held on day 5 itself.
+    prices = frame([[100, 100, 100]] * 10)
+    prices.loc[DAYS[5], "B"] = float("nan")
+    weights = frame([[0.0, 0.0, 0.0]] * 10)
+    weights.loc[DAYS[:5], "B"] = 1.0  # positions are these shifted one day, so B is held on day 5
+
+    with pytest.raises(BacktestDataError, match="NaN"):
+        run_backtest(weights, prices, DAYS[1].date(), DAYS[-1].date(), cfg())
+
+
+def test_inf_on_a_flat_column_scores_as_no_return():
+    # R4-STAT-10. An infinite return on a column with no position earns nothing, as a NaN does. The
+    # engine zeroes it explicitly, so no NaN reaches the sum, and no numpy warning is raised.
+    # This passed before the fix as well: the defect was the comment and the reliance on skipna.
+    weights = frame([[0.5, 0.0, 0.5]] * 10)
+    infinite = frame([[100, 100, 100]] * 10)
+    infinite.loc[DAYS[5], "B"] = float("inf")
+    filled = infinite.copy()
+    filled["B"] = 100.0
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with_inf = run_backtest(weights, infinite, DAYS[1].date(), DAYS[-1].date(), cfg())
+    no_inf = run_backtest(weights, filled, DAYS[1].date(), DAYS[-1].date(), cfg())
+
+    pd.testing.assert_series_equal(with_inf.net_returns, no_inf.net_returns)
+    assert np.isfinite(with_inf.gross_returns).all()
+
+
+def _random_weights_and_prices(seed: int = 4):
+    rng = np.random.default_rng(seed)
+    index = pd.bdate_range("2018-01-01", periods=120)
+    cols = [f"T{i}" for i in range(5)]
+    prices = pd.DataFrame(
+        100 * np.exp(np.cumsum(rng.normal(0.0002, 0.01, (120, 5)), axis=0)),
+        index=index,
+        columns=cols,
+    )
+    weights = pd.DataFrame(rng.normal(0.0, 0.3, (120, 5)), index=index, columns=cols)
+    return weights, prices
+
+
+def test_execution_lag_zero_is_the_default():
+    weights, prices = _random_weights_and_prices()
+    lo, hi = prices.index[1].date(), prices.index[-1].date()
+
+    default = run_backtest(weights, prices, lo, hi, cfg())
+    explicit = run_backtest(weights, prices, lo, hi, cfg(), execution_lag=0)
+
+    pd.testing.assert_series_equal(default.net_returns, explicit.net_returns)
+    assert default.metrics.sharpe == explicit.metrics.sharpe
+
+
+def test_execution_lag_one_is_the_same_weights_one_bar_later():
+    # The fill moves one bar, so lag 1 is the default run on weights shifted down one more row. The
+    # returns, costs and turnover must then match exactly.
+    weights, prices = _random_weights_and_prices()
+    lo, hi = prices.index[1].date(), prices.index[-1].date()
+
+    lagged = run_backtest(weights, prices, lo, hi, cfg(), execution_lag=1)
+    shifted = run_backtest(weights.shift(1).fillna(0.0), prices, lo, hi, cfg())
+
+    pd.testing.assert_series_equal(lagged.net_returns, shifted.net_returns)
+    pd.testing.assert_series_equal(lagged.turnover, shifted.turnover)
+
+
+def test_execution_lag_one_moves_a_one_day_move_to_the_next_bar():
+    # A is 100 on day 0 and 110 from day 1 on. Buying A on day 0 earns the jump on day 1 at lag 0.
+    # At lag 1 the same position is only taken on day 1, so the jump is not earned at all. Costs are
+    # zero for this case.
+    prices = frame([[100, 100, 100]] + [[110, 100, 100]] * 9)
+    weights = frame([[0.0, 0.0, 0.0]] * 10)
+    weights.loc[DAYS[0], "A"] = 1.0
+
+    default = run_backtest(
+        weights, prices, DAYS[1].date(), DAYS[-1].date(), cfg(cost_bps_per_side=0.0)
+    )
+    lagged = run_backtest(
+        weights,
+        prices,
+        DAYS[1].date(),
+        DAYS[-1].date(),
+        cfg(cost_bps_per_side=0.0),
+        execution_lag=1,
+    )
+
+    assert default.net_returns.iloc[0] == pytest.approx(0.1)
+    assert lagged.net_returns.iloc[0] == pytest.approx(0.0)
+    assert lagged.net_returns.abs().max() == pytest.approx(0.0)
+
+
+def test_default_metrics_carry_the_lag_one_sharpe():
+    # STAT-07. The default run also records the Sharpe the same weights would get one bar later.
+    weights, prices = _random_weights_and_prices()
+    lo, hi = prices.index[1].date(), prices.index[-1].date()
+
+    default = run_backtest(weights, prices, lo, hi, cfg())
+    lagged = run_backtest(weights, prices, lo, hi, cfg(), execution_lag=1)
+
+    assert default.metrics.sharpe_lag1 == pytest.approx(lagged.metrics.sharpe)
+    assert default.metrics.sharpe_lag1 != pytest.approx(default.metrics.sharpe)  # not vacuous
+
+
+def test_lag_one_sharpe_is_nan_when_lag_one_execution_would_be_refused():
+    # Lag 0 is fine: B is flat on day 5 and on day 4, so the NaN is no return. At lag 1 B is still
+    # held on day 4 and flat on day 5, so the NaN would be crossed by a sale. The default result must
+    # stand, the lag-one Sharpe is NaN, and an explicit lag-one run refuses the window.
+    prices = frame([[100, 100, 100]] * 10)
+    prices.loc[DAYS[5], "B"] = float("nan")
+    weights = frame([[0.0, 0.0, 0.0]] * 10)
+    weights.loc[DAYS[2], "B"] = 1.0
+
+    default = run_backtest(weights, prices, DAYS[1].date(), DAYS[-1].date(), cfg())
+
+    assert math.isnan(default.metrics.sharpe_lag1)
+    with pytest.raises(BacktestDataError, match="NaN"):
+        run_backtest(weights, prices, DAYS[1].date(), DAYS[-1].date(), cfg(), execution_lag=1)
+
+
+@pytest.mark.parametrize("bad_lag", [-1, 1.5, True])
+def test_execution_lag_must_be_a_whole_number_of_bars_zero_or_more(bad_lag):
+    prices = frame([[100, 100, 100]] * 10)
+    weights = frame([[0.0, 0.0, 0.0]] * 10)
+
+    with pytest.raises(ValueError, match="execution_lag"):
+        run_backtest(weights, prices, DAYS[1].date(), DAYS[-1].date(), cfg(), execution_lag=bad_lag)

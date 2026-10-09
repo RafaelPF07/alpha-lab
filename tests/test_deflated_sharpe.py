@@ -5,12 +5,15 @@ import pandas as pd
 import pytest
 
 from alpha_lab.backtest.metrics import (
-    EULER_GAMMA,
     deflated_sharpe_ratio,
     expected_max_sharpe,
     moments,
     per_period_sharpe,
 )
+
+# Typed in from the constant's definition (0.5772156649015329), not imported from the module under
+# test, so the test below does not check the formula against its own constant.
+_EULER = 0.5772156649015329
 
 
 def _norm_cdf(x: float) -> float:
@@ -30,13 +33,15 @@ def _norm_ppf(p: float) -> float:
     return (lo + hi) / 2
 
 
-def test_expected_max_matches_independent_calculation():
+def test_expected_max_matches_a_reimplementation_of_the_formula():
+    # Re-implements SR0 with a bisection inverse CDF. It checks the code against the formula,
+    # not against an external value (that is the order-statistic test below).
     n, v = 50, 0.02
     e = math.e
-    independent = math.sqrt(v) * (
-        (1 - EULER_GAMMA) * _norm_ppf(1 - 1 / n) + EULER_GAMMA * _norm_ppf(1 - 1 / (n * e))
+    reimplemented = math.sqrt(v) * (
+        (1 - _EULER) * _norm_ppf(1 - 1 / n) + _EULER * _norm_ppf(1 - 1 / (n * e))
     )
-    assert expected_max_sharpe(n, v) == pytest.approx(independent, rel=1e-9)
+    assert expected_max_sharpe(n, v) == pytest.approx(reimplemented, rel=1e-9)
 
 
 def test_expected_max_is_close_to_a_known_order_statistic():
@@ -121,3 +126,54 @@ def test_moments_of_a_normal_sample_are_close_to_normal_values():
 def test_too_few_observations_is_rejected():
     with pytest.raises(ValueError):
         deflated_sharpe_ratio(0.1, 1, 0.0, 3.0, 10, 0.1)
+
+
+def test_zero_trial_variance_with_many_trials_is_nan_not_the_plain_psr():
+    # DECISION-12 / R3-STAT-01: SR0 is 0 when V is 0, so the DSR would silently equal the PSR
+    # (0.987 here) whatever N is. The value must be NaN instead.
+    assert math.isnan(deflated_sharpe_ratio(0.1, 500, 0.0, 3.0, n_trials=100, sharpe_variance=0.0))
+
+
+@pytest.mark.parametrize("bad_variance", [-1e-3, float("nan"), float("inf")])
+def test_unestimable_trial_variance_with_many_trials_is_nan(bad_variance):
+    assert math.isnan(
+        deflated_sharpe_ratio(0.1, 500, 0.0, 3.0, n_trials=100, sharpe_variance=bad_variance)
+    )
+
+
+def test_expected_max_with_unestimable_variance_is_nan():
+    assert math.isnan(expected_max_sharpe(50, float("nan")))
+    assert math.isnan(expected_max_sharpe(50, -1e-3))
+
+
+@pytest.mark.parametrize("n_trials", [2, 10, 100, 500])
+def test_expected_max_is_within_the_documented_band_of_monte_carlo(n_trials):
+    # R3-QA-06(b). The docstring of expected_max_sharpe states that the Gumbel formula is within
+    # about 0.05 of the simulated expected maximum for N from 2 to 500. Seeded, so it is repeatable.
+    rng = np.random.default_rng(12345)
+    chunks = [rng.standard_normal((10_000, n_trials)).max(axis=1) for _ in range(10)]
+    simulated = float(np.concatenate(chunks).mean())  # 100,000 draws: standard error under 0.003
+    assert expected_max_sharpe(n_trials, 1.0) == pytest.approx(simulated, abs=0.05)
+
+
+def test_trials_that_differ_only_by_rounding_are_no_spread():
+    # R4-STAT-01. 50 trials whose Sharpe ratios differ by 1e-10 relative have a variance of about
+    # 6e-21, which is positive, so the old exact-zero guard let it through. The DSR then equalled the
+    # plain PSR. The spread is far below the sampling variance 1 / (T - 1), so it must be NaN.
+    sharpes = 0.02 * (1.0 + 1e-10 * np.arange(50))
+    variance = float(np.var(sharpes, ddof=1))
+    assert 0.0 < variance < 1e-18
+
+    assert math.isnan(
+        deflated_sharpe_ratio(0.02, 300, 0.0, 3.0, n_trials=50, sharpe_variance=variance)
+    )
+
+
+def test_a_real_spread_is_not_treated_as_rounding():
+    # The floor is 1e-6 of the sampling variance, so a spread of a tenth of the sampling variance counts.
+    from alpha_lab.backtest.metrics import has_spread
+
+    assert has_spread(0.1 / 299, 300)
+    assert not has_spread(1e-6 / 299 / 10, 300)
+    assert not has_spread(float("nan"), 300)
+    assert not has_spread(0.0, 300)

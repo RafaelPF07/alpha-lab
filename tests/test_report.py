@@ -1,11 +1,12 @@
 import asyncio
 import json
+import math
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
-from fakes import RoutingAnthropic, tool_response
+from fakes import RoutingAnthropic, tool_response, with_test_cache_prices
 
 from alpha_lab.backtest.metrics import deflated_sharpe_ratio, expected_max_sharpe, moments
 from alpha_lab.config import GatesConfig, load_settings
@@ -37,7 +38,7 @@ IDEA = {
 
 
 def test_report_is_written_with_funnel_dsr_and_figures(tmp_path):
-    settings = load_settings()
+    settings = with_test_cache_prices(load_settings())
     settings = settings.model_copy(
         update={
             "gates": GatesConfig(
@@ -77,7 +78,9 @@ def test_report_is_written_with_funnel_dsr_and_figures(tmp_path):
     assert data.funnel[0] == ("ideas generated", 1)
     assert data.funnel[-1][0] == "passed validation"
     assert len(data.candidates) == 1
-    assert np.isfinite(data.candidates[0].deflated_sharpe)
+    # One train-backtested trial cannot estimate the trial variance, so the DSR is NaN (DECISION-12).
+    assert math.isnan(data.candidates[0].deflated_sharpe)
+    assert "fewer than two" in data.dsr_reason
 
     markdown = render_markdown(data)
     for heading in [
@@ -99,9 +102,26 @@ def test_report_is_written_with_funnel_dsr_and_figures(tmp_path):
 VAL_DAYS = pd.bdate_range("2019-01-01", periods=400)
 
 
-def _add_validated(ledger, run_id, n, name, returns, passed=True):
-    """One idea, one attempt with a train backtest, and one validation with daily returns."""
+def _add_validated(
+    ledger, run_id, n, name, returns, passed=True, train_sharpe=0.5, n_days=1000.0, lag1_sharpe=None
+):
+    """One idea, one attempt with a train backtest, and one validation with daily returns.
+
+    n_days=None leaves n_days out of the train metrics (a ledger without train lengths). lag1_sharpe
+    adds the lag-one Sharpe to the validation metrics, as the engine writes it (STAT-07).
+    """
     idea_id, attempt_id = f"idea{n}", f"attempt{n}"
+    train_metrics = (
+        {"sharpe": train_sharpe}
+        if n_days is None
+        else {
+            "sharpe": train_sharpe,
+            "n_days": n_days,
+        }
+    )
+    validation_metrics = {"sharpe": 0.9, "avg_daily_turnover": 0.1}
+    if lag1_sharpe is not None:
+        validation_metrics["sharpe_lag1"] = lag1_sharpe
     ledger.add_idea(
         idea_id=idea_id,
         run_id=run_id,
@@ -121,13 +141,11 @@ def _add_validated(ledger, run_id, n, name, returns, passed=True):
         static_ok=1,
         sandbox_ok=1,
         lookahead_ok=1,
-        train_metrics_json=json.dumps({"sharpe": 0.5, "n_days": 1000.0}),
+        train_metrics_json=json.dumps(train_metrics),
     )
     ledger.add_trial(f"trial{n}", run_id, attempt_id, attempt_id)
     series = None if returns is None else {str(d.date()): float(r) for d, r in returns.items()}
-    ledger.add_validation(
-        attempt_id, run_id, {"sharpe": 0.9, "avg_daily_turnover": 0.1}, passed, None, series
-    )
+    ledger.add_validation(attempt_id, run_id, validation_metrics, passed, None, series)
 
 
 def test_validation_rows_without_enough_returns_are_skipped_and_counted(tmp_path):
@@ -257,7 +275,7 @@ def _best_of_noise_trials(rng, n_trials=200, t_train=1000, t_val=400):
         {"sharpe": float(sr_val[best]) * np.sqrt(252), "avg_daily_turnover": 0.1},
         False,
         None,
-        {str(d.date()): float(r) for d, r in zip(days, val[best])},
+        {str(d.date()): float(r) for d, r in zip(days, val[best], strict=True)},
     )
     data = build_report_data(ledger, "noise")
     ledger.close()
@@ -281,3 +299,206 @@ def test_best_of_noise_trials_gets_a_dsr_near_one_half(tmp_path):
 
     assert np.allclose(reported, by_hand, atol=1e-9)
     assert 0.35 < float(np.median(reported)) < 0.65
+
+
+def _add_sandboxed_trials(ledger, run_id, n, idea_id="idea0", status="failed_sandbox"):
+    """Trials that reached the sandbox but have no train Sharpe (no train backtest)."""
+    for i in range(n):
+        ledger.add_attempt(
+            attempt_id=f"{status}{i}",
+            idea_id=idea_id,
+            run_id=run_id,
+            attempt_number=2,
+            status=status,
+        )
+        ledger.add_trial(f"{status}_t{i}", run_id, f"{status}{i}", f"{status}{i}")
+
+
+def test_one_train_trial_among_fifty_has_no_deflated_sharpe(tmp_path):
+    # R3-STAT-01 / R3-WHOLE-04. Before the fix, V was set to 0, SR0 to 0, and the DSR printed
+    # 0.289 (the plain PSR) for N = 50. DECISION-12: it must be NaN with a reason.
+    ledger = Ledger(tmp_path / "one.db")
+    ledger.create_run("one", "{}", 1.0)
+    rng = np.random.default_rng(5)
+    returns = pd.Series(rng.normal(0.001, 0.01, 300), VAL_DAYS[:300])
+    _add_validated(ledger, "one", 0, "lone survivor", returns)
+    _add_sandboxed_trials(ledger, "one", 49)
+
+    data = build_report_data(ledger, "one")
+
+    assert data.n_trials == 50
+    assert data.n_train_trials == 1
+    assert math.isnan(data.candidates[0].deflated_sharpe)
+    assert math.isnan(data.expected_max_annual)
+    assert "fewer than two" in data.dsr_reason
+    markdown = render_markdown(data)
+    assert "trials in the ledger (N): 50" in markdown
+    assert "with a finite train Sharpe (V): 1" in markdown
+    assert "DSR: n/a" in markdown
+    assert "fewer than two" in markdown
+
+
+def test_trials_with_no_spread_have_no_deflated_sharpe(tmp_path):
+    # Two trials with identical train Sharpe ratios: V = 0, so SR0 = 0 and the DSR would equal the
+    # PSR. It must be NaN (DECISION-12).
+    ledger = Ledger(tmp_path / "flat.db")
+    ledger.create_run("flat", "{}", 1.0)
+    rng = np.random.default_rng(6)
+    for n, name in enumerate(["first", "second"]):
+        returns = pd.Series(rng.normal(0.001, 0.01, 300), VAL_DAYS[:300])
+        _add_validated(ledger, "flat", n, name, returns)
+
+    data = build_report_data(ledger, "flat")
+
+    assert all(math.isnan(c.deflated_sharpe) for c in data.candidates)
+    assert "no spread" in data.dsr_reason
+
+
+def test_few_train_trials_get_a_warning_in_the_report(tmp_path):
+    ledger = Ledger(tmp_path / "few.db")
+    ledger.create_run("few", "{}", 1.0)
+    rng = np.random.default_rng(7)
+    for n, sharpe in enumerate([0.1, 0.4, 0.7]):
+        _add_validated(
+            ledger,
+            "few",
+            n,
+            f"signal {n}",
+            pd.Series(rng.normal(0.001, 0.01, 300), VAL_DAYS[:300]),
+            train_sharpe=sharpe,
+        )
+
+    data = build_report_data(ledger, "few")
+    markdown = render_markdown(data)
+
+    assert data.dsr_reason == ""
+    assert all(math.isfinite(c.deflated_sharpe) for c in data.candidates)
+    assert "warning" in markdown and "fewer than ten" in markdown
+
+
+def test_failed_backtests_are_counted_in_the_multiple_testing_section(tmp_path):
+    # STAT-02, report side: attempts that failed the train backtest are in N and not in V.
+    ledger = Ledger(tmp_path / "fb.db")
+    ledger.create_run("fb", "{}", 1.0)
+    survivor = pd.Series(np.random.default_rng(8).normal(0.001, 0.01, 60), VAL_DAYS[:60])
+    _add_validated(ledger, "fb", 0, "survivor", survivor)
+    _add_sandboxed_trials(ledger, "fb", 2, status="failed_backtest")
+
+    markdown = render_markdown(build_report_data(ledger, "fb"))
+
+    assert "attempts that ended in failed_backtest (a data error" in markdown
+    assert "failed_backtest" in markdown and "| 2 |" in markdown
+
+
+def test_an_idea_whose_critic_output_failed_still_passed_the_train_gate(tmp_path):
+    # R3-WHOLE-20 and DECISION-13. failed_critic_output comes after the train gate (single.py),
+    # so the funnel must count it as past the gate and not as past the critic.
+    ledger = Ledger(tmp_path / "critic.db")
+    ledger.create_run("critic", "{}", 1.0)
+    ledger.add_idea(
+        idea_id="idea",
+        run_id="critic",
+        pipeline_id="p",
+        name="no usable review",
+        hypothesis="Test hypothesis text here.",
+        description="Test description here.",
+        expected_holding_period_days=21,
+        theme="momentum",
+    )
+    ledger.add_attempt(
+        attempt_id="attempt",
+        idea_id="idea",
+        run_id="critic",
+        attempt_number=1,
+        status="failed_critic_output",
+        static_ok=1,
+        sandbox_ok=1,
+        lookahead_ok=1,
+        train_metrics_json=json.dumps({"sharpe": 0.5, "n_days": 1000.0}),
+    )
+
+    funnel = dict(build_report_data(ledger, "critic").funnel)
+
+    assert funnel["passed train gate"] == 1
+    assert funnel["passed critic"] == 0
+
+
+def test_no_train_lengths_means_no_validation_dsr(tmp_path):
+    # R4-STAT-07. Without train lengths the trial variance cannot be length-matched (DECISION-6). The
+    # DSR must fail closed with a reason, not fall back to the unmatched variance (DECISION-12).
+    ledger = Ledger(tmp_path / "nolen.db")
+    ledger.create_run("nolen", "{}", 1.0)
+    rng = np.random.default_rng(9)
+    for n, sharpe in enumerate([0.1, 0.9]):
+        _add_validated(
+            ledger,
+            "nolen",
+            n,
+            f"signal {n}",
+            pd.Series(rng.normal(0.001, 0.01, 300), VAL_DAYS[:300]),
+            train_sharpe=sharpe,
+            n_days=None,
+        )
+
+    data = build_report_data(ledger, "nolen")
+
+    assert all(math.isnan(c.deflated_sharpe) for c in data.candidates)
+    assert "length" in data.dsr_reason
+    assert "DSR: n/a" in render_markdown(data)
+
+
+def test_trials_differing_only_by_rounding_have_no_deflated_sharpe(tmp_path):
+    # R4-STAT-01. Fifty train Sharpes that differ by 1e-10 relative are not a spread: the DSR must be
+    # NaN with the reason, not the PSR.
+    ledger = Ledger(tmp_path / "rounding.db")
+    ledger.create_run("rounding", "{}", 1.0)
+    rng = np.random.default_rng(10)
+    for n in range(50):
+        _add_validated(
+            ledger,
+            "rounding",
+            n,
+            f"signal {n}",
+            pd.Series(rng.normal(0.001, 0.01, 300), VAL_DAYS[:300]),
+            train_sharpe=0.5 * (1.0 + 1e-10 * n),
+        )
+
+    data = build_report_data(ledger, "rounding")
+
+    assert data.n_train_trials == 50
+    assert all(math.isnan(c.deflated_sharpe) for c in data.candidates)
+    assert "no spread" in data.dsr_reason
+
+
+def test_the_lag_one_sharpe_sits_next_to_the_default_in_the_report(tmp_path):
+    # STAT-07. The report states the validation Sharpe at lag 1 next to the default. A row from a run
+    # with no lag-one figure shows n/a rather than a number.
+    ledger = Ledger(tmp_path / "lag.db")
+    ledger.create_run("lag", "{}", 1.0)
+    rng = np.random.default_rng(12)
+    _add_validated(
+        ledger,
+        "lag",
+        0,
+        "with lag",
+        pd.Series(rng.normal(0.001, 0.01, 300), VAL_DAYS[:300]),
+        lag1_sharpe=0.4,
+    )
+    _add_validated(
+        ledger,
+        "lag",
+        1,
+        "older run",
+        pd.Series(rng.normal(0.001, 0.01, 300), VAL_DAYS[:300]),
+    )
+
+    data = build_report_data(ledger, "lag")
+    by_name = {c.name: c for c in data.candidates}
+    assert by_name["with lag"].validation_sharpe_lag1 == pytest.approx(0.4)
+    assert math.isnan(by_name["older run"].validation_sharpe_lag1)
+
+    markdown = render_markdown(data)
+    section = markdown.split("## Execution lag", 1)[1].split("## Theme leaderboard", 1)[0]
+    assert "validation SR, lag 0" in section and "validation SR, lag 1" in section
+    assert "| with lag | 0.900 | 0.400 |" in section
+    assert "| older run | 0.900 | n/a |" in section

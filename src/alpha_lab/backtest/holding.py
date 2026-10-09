@@ -3,6 +3,11 @@
 Weights are sampled every `holding_days` rows and forward-filled. A weight taken on day t
 only uses prices up to day t, so this does not introduce lookahead. It lowers turnover,
 and with it the cost drag that daily-rebalanced signals suffer.
+
+Constant mix: between rebalances the held weights are the fractions set on the rebalance day.
+The engine therefore treats the book as traded back to those fractions every day at no cost.
+Return drift is not simulated, so the trades that drift would force are not charged (see the
+known limitations in ledger/report.py).
 """
 
 from __future__ import annotations

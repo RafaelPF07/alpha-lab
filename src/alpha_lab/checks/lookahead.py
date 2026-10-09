@@ -30,8 +30,10 @@ class LookaheadResult:
 def _cutoffs(index: pd.DatetimeIndex, n: int) -> list[pd.Timestamp]:
     """n cutoff dates spread evenly from 15% to 95% of the rows.
 
-    The span reaches both tails, so a leak confined to late rows is compared. The first cutoff
-    stays past the 252-day lookback on the training window (about 350 rows of about 2,350).
+    A cutoff compares every row up to it, so a leak in any row before the last cutoff is compared.
+    Rows after the last cutoff (the final 5%) are never compared, so a leak confined to them is
+    not detected. The first cutoff stays past the 252-day lookback on the training window (about
+    350 rows of about 2,350).
     """
     positions = np.linspace(int(len(index) * 0.15), int(len(index) * 0.95), n).astype(int)
     return [index[p] for p in positions]

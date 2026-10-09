@@ -16,6 +16,21 @@ import pandas as pd
 EULER_GAMMA = 0.5772156649015329
 _NORMAL = NormalDist()
 
+# A variance of trial Sharpe ratios below this fraction of the sampling variance 1 / (T - 1) of one
+# Sharpe ratio is no spread: the trials differ only by rounding (R4-STAT-01). Exact zero is not enough.
+NO_SPREAD_FRACTION = 1e-6
+
+
+def has_spread(sharpe_variance: float, n_obs: float) -> bool:
+    """True when a trial variance measured on samples of length n_obs is a real spread.
+
+    The variance must be finite and positive, and above NO_SPREAD_FRACTION of 1 / (n_obs - 1). The
+    test is written without a division, so n_obs of 1 or less gives False.
+    """
+    if not math.isfinite(sharpe_variance):
+        return False
+    return sharpe_variance * (n_obs - 1.0) > NO_SPREAD_FRACTION
+
 
 @dataclass(frozen=True)
 class Metrics:
@@ -26,6 +41,9 @@ class Metrics:
     max_drawdown: float  # most negative peak-to-trough fall of the equity curve, <= 0
     avg_daily_turnover: float
     hit_rate: float  # fraction of days with a positive net return
+    # Sharpe of the same weights if every fill came one bar later (execution lag 1, STAT-07). Set by
+    # run_backtest. NaN when the data checks refuse that later execution.
+    sharpe_lag1: float = float("nan")
 
 
 def compute_metrics(
@@ -66,16 +84,21 @@ def expected_max_sharpe(n_trials: int, sharpe_variance: float) -> float:
     V is the variance of the trials' Sharpe ratios, g is the Euler-Mascheroni
     constant, Z^-1 is the inverse standard normal CDF and e is Euler's number.
     This is a Gumbel approximation to the expected maximum of N independent normal draws,
-    not an exact value. Against Monte Carlo it is about 0.04 low at N = 2 (0.520 against the
-    exact 1/sqrt(pi) = 0.564) and within about 0.04 for N from 10 to 500.
+    not an exact value. Against a seeded Monte Carlo of the maximum (formula minus simulation,
+    V = 1) the error is -0.045 at N = 2 (0.520 against the exact 1/sqrt(pi) = 0.564), +0.035 at
+    N = 10, +0.022 at N = 100 and +0.018 at N = 500. The tests check a band of 0.05
+    (tests/test_deflated_sharpe.py).
+
+    With N >= 2, a variance that is not finite or is negative gives NaN, not 0. A zero SR0 would
+    make the DSR the plain PSR (DECISION-12).
     """
     if n_trials < 2:
         return 0.0
+    if not math.isfinite(sharpe_variance) or sharpe_variance < 0:
+        return float("nan")
     first = _NORMAL.inv_cdf(1.0 - 1.0 / n_trials)
     second = _NORMAL.inv_cdf(1.0 - 1.0 / (n_trials * math.e))
-    return math.sqrt(max(sharpe_variance, 0.0)) * (
-        (1.0 - EULER_GAMMA) * first + EULER_GAMMA * second
-    )
+    return math.sqrt(sharpe_variance) * ((1.0 - EULER_GAMMA) * first + EULER_GAMMA * second)
 
 
 def deflated_sharpe_ratio(
@@ -104,9 +127,16 @@ def deflated_sharpe_ratio(
 
     A DSR near 1 means the Sharpe is unlikely to be a lucky maximum over N trials.
     A DSR near 0.5 means the candidate is indistinguishable from the best noise trial.
+
+    With N >= 2, a trial variance that is zero, negative, not finite or below the rounding floor
+    (has_spread) gives NaN. The variance cannot be estimated then, and a zero SR0 would silently report
+    the plain PSR (DECISION-12, R4-STAT-01).
+    With N = 1 there is no multiple-testing correction, so the PSR is returned.
     """
     if n_obs < 2:
         raise ValueError("need at least 2 observations")
+    if n_trials > 1 and not has_spread(sharpe_variance, n_obs):
+        return float("nan")
     sr0 = expected_max_sharpe(n_trials, sharpe_variance)
     variance_term = 1.0 - skew * sharpe + (kurtosis - 1.0) / 4.0 * sharpe**2
     if variance_term <= 0:

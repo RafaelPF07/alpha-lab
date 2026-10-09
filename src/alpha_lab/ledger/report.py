@@ -19,18 +19,20 @@ import pandas as pd
 from alpha_lab.backtest.metrics import (
     deflated_sharpe_ratio,
     expected_max_sharpe,
+    has_spread,
     moments,
     per_period_sharpe,
 )
 from alpha_lab.config import PROJECT_ROOT
 from alpha_lab.ledger.db import Ledger
+from alpha_lab.statuses import PASSED_CRITIC, PASSED_TRAIN_GATE, PASSED_VALIDATION
 
-TRAIN_GATE_STATUSES = ("critic_pass", "failed_critic", "validation_pass", "validation_fail")
-CRITIC_STATUSES = ("critic_pass", "validation_pass", "validation_fail")
 CLUSTER_CORRELATION = 0.7
 TOP_N = 10
 ANNUALISATION = 252  # fallback for runs whose config snapshot has no backtest settings
 MIN_VALIDATION_DAYS = 3  # fewer daily returns than this: the validation row is skipped (BE-02)
+# Fewer train trials than this and the report warns that the trial variance is noisy.
+MIN_TRIALS_FOR_VARIANCE = 10
 
 
 @dataclass
@@ -47,6 +49,8 @@ class CandidateRow:
     validation_returns: pd.Series
     train_returns: pd.Series
     passed: bool
+    # Validation Sharpe with every fill one bar later (STAT-07). NaN for runs that did not record it.
+    validation_sharpe_lag1: float = float("nan")
 
 
 @dataclass
@@ -65,6 +69,10 @@ class ReportData:
     themes: list[dict] = field(default_factory=list)
     skipped_validations: int = 0  # validation rows with no returns, or fewer than three
     trial_train_days: float = 0.0  # median train days behind the trial variance (0 if unknown)
+    n_train_trials: int = 0  # trials with a finite train Sharpe: the population of the variance (V)
+    # Why the validation DSRs are NaN, or "" when they are defined (DECISION-12). The DSR is never
+    # reported as the uncorrected value.
+    dsr_reason: str = ""
 
 
 def _series(data: str | None) -> pd.Series:
@@ -160,9 +168,9 @@ def build_report_data(ledger: Ledger, run_id: str, annualization: int | None = N
         ("passed static checks", distinct(attempts, lambda r: r["static_ok"] == 1)),
         ("ran in sandbox", distinct(attempts, lambda r: r["sandbox_ok"] == 1)),
         ("passed lookahead tests", distinct(attempts, lambda r: r["lookahead_ok"] == 1)),
-        ("passed train gate", distinct(attempts, lambda r: r["status"] in TRAIN_GATE_STATUSES)),
-        ("passed critic", distinct(attempts, lambda r: r["status"] in CRITIC_STATUSES)),
-        ("passed validation", distinct(attempts, lambda r: r["status"] == "validation_pass")),
+        ("passed train gate", distinct(attempts, lambda r: r["status"] in PASSED_TRAIN_GATE)),
+        ("passed critic", distinct(attempts, lambda r: r["status"] in PASSED_CRITIC)),
+        ("passed validation", distinct(attempts, lambda r: r["status"] in PASSED_VALIDATION)),
     ]
 
     spend = [
@@ -189,9 +197,36 @@ def build_report_data(ledger: Ledger, run_id: str, annualization: int | None = N
             if "n_days" in metrics:
                 trial_days.append(float(metrics["n_days"]))
     n_trials = ledger.count_trials()
-    variance = float(np.var(trial_sharpes, ddof=1)) if len(trial_sharpes) > 1 else 0.0
-    expected_max = expected_max_sharpe(n_trials, variance) * math.sqrt(annualization)
+    # DECISION-12: the DSR fails closed. Two finite train Sharpes are the least that gives a variance,
+    # and a zero variance would make SR0 zero and the DSR the plain PSR. Either way the DSRs are NaN.
+    n_correction = max(n_trials, len(trial_sharpes), 2)
     train_days = float(median(trial_days)) if trial_days else 0.0
+    dsr_reason = ""
+    variance = float("nan")
+    if len(trial_sharpes) < 2:
+        dsr_reason = (
+            f"fewer than two trials have a finite train Sharpe ({len(trial_sharpes)} found), "
+            "so the trial variance cannot be estimated"
+        )
+    elif not train_days:
+        # DECISION-6 rescales the variance from train length to validation length. Without the train
+        # lengths it cannot be rescaled, and using it unscaled is the fallback DECISION-12 forbids.
+        dsr_reason = (
+            "the train lengths of the trials are not in the ledger, so the trial variance cannot "
+            "be length-matched"
+        )
+    else:
+        variance = float(np.var(trial_sharpes, ddof=1))
+        if not has_spread(variance, train_days):
+            dsr_reason = (
+                "the trial Sharpe ratios have no spread (their variance is zero or below rounding), "
+                "so SR0 would be zero"
+            )
+    expected_max = (
+        expected_max_sharpe(n_correction, variance) * math.sqrt(annualization)
+        if not dsr_reason
+        else float("nan")
+    )
 
     data = ReportData(
         run_id=run_id,
@@ -202,6 +237,8 @@ def build_report_data(ledger: Ledger, run_id: str, annualization: int | None = N
         n_trials=n_trials,
         trial_sharpe_variance=variance,
         trial_train_days=train_days,
+        n_train_trials=len(trial_sharpes),
+        dsr_reason=dsr_reason,
     )
 
     failures = conn.execute(
@@ -231,22 +268,20 @@ def build_report_data(ledger: Ledger, run_id: str, annualization: int | None = N
             continue
         metrics = json.loads(v["metrics_json"])
         train_metrics = json.loads(v["train_metrics_json"]) if v["train_metrics_json"] else {}
-        # DECISION-6: the trial variance was measured on train-length samples, so rescale it to
-        # this candidate's validation length before it sets the hurdle.
-        sample_variance = (
-            length_matched_variance(variance, train_days, len(val_returns))
-            if train_days
-            else variance
-        )
-        skew, kurt = moments(val_returns)
-        dsr = deflated_sharpe_ratio(
-            sharpe=per_period_sharpe(val_returns),
-            n_obs=len(val_returns),
-            skew=skew,
-            kurtosis=kurt,
-            n_trials=max(n_trials, 2),
-            sharpe_variance=sample_variance,
-        )
+        dsr = float("nan")
+        if not dsr_reason:
+            # DECISION-6: the trial variance was measured on train-length samples, so rescale it to
+            # this candidate's validation length before it sets the hurdle.
+            sample_variance = length_matched_variance(variance, train_days, len(val_returns))
+            skew, kurt = moments(val_returns)
+            dsr = deflated_sharpe_ratio(
+                sharpe=per_period_sharpe(val_returns),
+                n_obs=len(val_returns),
+                skew=skew,
+                kurtosis=kurt,
+                n_trials=n_correction,
+                sharpe_variance=sample_variance,
+            )
         candidates.append(
             CandidateRow(
                 name=v["name"],
@@ -261,6 +296,7 @@ def build_report_data(ledger: Ledger, run_id: str, annualization: int | None = N
                 validation_returns=val_returns,
                 train_returns=_series(v["train_returns_json"]),
                 passed=bool(v["passed"]),
+                validation_sharpe_lag1=_num(metrics.get("sharpe_lag1")),
             )
         )
     candidates.sort(key=lambda c: -(c.deflated_sharpe if math.isfinite(c.deflated_sharpe) else -1))
@@ -270,7 +306,9 @@ def build_report_data(ledger: Ledger, run_id: str, annualization: int | None = N
     survivors = [c for c in candidates if c.passed]
     if len(survivors) >= 2:
         # Keyed by unique labels, so two survivors with the same name both reach the matrix.
-        labelled = dict(zip(_labels(survivors), (c.validation_returns for c in survivors)))
+        labelled = dict(
+            zip(_labels(survivors), (c.validation_returns for c in survivors), strict=True)
+        )
         data.correlation = pd.concat(labelled, axis=1).corr()
         data.clusters = _clusters(data.correlation, CLUSTER_CORRELATION)
 
@@ -308,9 +346,9 @@ def build_report_data(ledger: Ledger, run_id: str, annualization: int | None = N
         theme = idea_theme.get(row["idea_id"])
         if theme is None:
             continue
-        if row["status"] in CRITIC_STATUSES:
+        if row["status"] in PASSED_CRITIC:
             themes[theme]["stage_pass"]["critic"] += 1
-        if row["status"] == "validation_pass":
+        if row["status"] in PASSED_VALIDATION:
             themes[theme]["stage_pass"]["validation"] += 1
     data.themes = [
         {
@@ -350,6 +388,7 @@ def render_markdown(data: ReportData) -> str:
     total = sum(c for *_, c in data.spend)
     lines += [f"| **total** | | | **{total:.4f}** |", ""]
 
+    failed_backtests = sum(n for status, n in data.failures if status == "failed_backtest")
     lines += [
         "## Multiple testing",
         "",
@@ -358,13 +397,34 @@ def render_markdown(data: ReportData) -> str:
             "N counts every trial that reached the sandbox."
         ),
         (
-            "- variance of train Sharpe ratios across trials (per period): "
-            f"{data.trial_sharpe_variance:.6g}. Only trials with a train backtest are in the "
-            "variance, so trials that failed the sandbox or the lookahead tests are not."
+            f"- trials with a finite train Sharpe (V): {data.n_train_trials}. Only these are in the "
+            "variance. A trial that failed before its train backtest has no Sharpe, so it counts in "
+            "N and not in V."
         ),
-        f"- expected maximum annualised Sharpe from pure noise at N: {data.expected_max_annual:.3f}",
+        (
+            f"- attempts that ended in failed_backtest (a data error in a train or validation "
+            f"window): {failed_backtests}"
+        ),
+        (
+            "- variance of train Sharpe ratios across trials (per period): "
+            f"{_fmt(data.trial_sharpe_variance, '.6g')}."
+        ),
+        (
+            "- expected maximum annualised Sharpe from pure noise at N: "
+            f"{_fmt(data.expected_max_annual)}"
+        ),
     ]
-    if data.trial_train_days:
+    if data.dsr_reason:
+        lines.append(
+            f"- DSR: n/a. {data.dsr_reason}. No validation DSR is shown, and the order of the "
+            "table below is not a ranking."
+        )
+    elif data.n_train_trials < MIN_TRIALS_FOR_VARIANCE:
+        lines.append(
+            f"- warning: fewer than ten trials have a train Sharpe ({data.n_train_trials}). The "
+            "trial variance rests on few points, so the DSRs are unreliable."
+        )
+    if data.trial_train_days and not data.dsr_reason:
         lines.append(
             "- validation DSRs rescale that variance from the median train length "
             f"({data.trial_train_days:.0f} days) to each candidate's validation length."
@@ -379,8 +439,8 @@ def render_markdown(data: ReportData) -> str:
     ]
     for c in top_by_deflated_sharpe(data):
         lines.append(
-            f"| {c.name} | {c.theme} | {c.train_sharpe:.3f} | {c.validation_sharpe:.3f} | "
-            f"{c.deflated_sharpe:.3f} | {c.turnover:.4f} | {c.revisions} |"
+            f"| {c.name} | {c.theme} | {_fmt(c.train_sharpe)} | {_fmt(c.validation_sharpe)} | "
+            f"{_fmt(c.deflated_sharpe)} | {_fmt(c.turnover, '.4f')} | {c.revisions} |"
         )
     if not data.candidates:
         lines.append("| (no signal reached validation) | | | | | | |")
@@ -388,6 +448,33 @@ def render_markdown(data: ReportData) -> str:
     lines.append(
         "- validation rows skipped (no returns, or fewer than three daily returns): "
         f"{data.skipped_validations}"
+    )
+
+    # STAT-07: the same signals with every fill one bar later. The DSRs above use lag 0 only.
+    shown = top_by_deflated_sharpe(data)
+    no_lag_one = sum(1 for c in shown if not math.isfinite(c.validation_sharpe_lag1))
+    lines += [
+        "",
+        "## Execution lag (validation Sharpe, fills one bar later)",
+        "",
+        (
+            "Lag 0 is the default: a weight decided at the close of day t earns the return from t to "
+            "t+1, and the DSRs use it. Lag 1 is the same weights filled one bar later. It is a "
+            "sensitivity check and is not corrected for the number of trials."
+        ),
+        "",
+        "| signal | validation SR, lag 0 | validation SR, lag 1 |",
+        "|---|---:|---:|",
+    ]
+    lines += [
+        f"| {c.name} | {_fmt(c.validation_sharpe)} | {_fmt(c.validation_sharpe_lag1)} |"
+        for c in shown
+    ]
+    if not data.candidates:
+        lines.append("| (no signal reached validation) | | |")
+    lines.append(
+        f"- rows with no lag-one figure: {no_lag_one} of {len(shown)}. The run predates the figure, "
+        "or the data refuse fills one bar later."
     )
 
     lines += ["", "## Correlation clusters (daily returns above 0.7)", ""]
@@ -426,7 +513,8 @@ def render_markdown(data: ReportData) -> str:
         (
             "- Same-bar execution: a weight decided from the close of day t earns the return from "
             "close t to close t+1, so the decision and the fill share a bar. This flatters short "
-            "holding periods. No extra delay is modelled."
+            "holding periods. The DSRs use this convention. The execution-lag table shows the "
+            "validation Sharpe with fills one bar later, and it is the size of this effect."
         ),
         (
             "- Constant-mix returns: between rebalances the engine holds the target weights, which "
@@ -442,9 +530,14 @@ def render_markdown(data: ReportData) -> str:
         "- The LLM may have learned about the post-2010 market during training (subtle lookahead).",
         (
             "- The deflated Sharpe assumes the trial Sharpe ratios are the search space that was "
-            "actually explored. Its variance counts only trials with a train backtest, and it is "
-            "rescaled from train to validation length, which assumes the spread across trials is "
-            "mostly noise."
+            "actually explored. Its variance counts only trials with a finite train Sharpe, and it "
+            "is rescaled from train to validation length, which assumes the spread across trials "
+            "is mostly noise. The DSR is n/a when fewer than two such trials exist or their spread "
+            "is zero. It is never shown as the uncorrected value."
+        ),
+        (
+            "- Lookahead tests compare five cut-offs between 15% and 95% of the rows. A leak that "
+            "only affects the last 5% of the rows, after the last cut-off, is not detected."
         ),
         "- Small universe of 50 names. Results are not evidence of a tradable edge.",
         "",
@@ -452,8 +545,8 @@ def render_markdown(data: ReportData) -> str:
     return "\n".join(lines)
 
 
-def _fmt(x: float) -> str:
-    return "n/a" if x is None or not math.isfinite(x) else f"{x:.3f}"
+def _fmt(x: float, spec: str = ".3f") -> str:
+    return "n/a" if x is None or not math.isfinite(x) else format(x, spec)
 
 
 def write_report(ledger: Ledger, run_id: str, out_dir: Path | None = None) -> Path:
@@ -498,9 +591,12 @@ def write_report(ledger: Ledger, run_id: str, out_dir: Path | None = None) -> Pa
     if data.all_train_sharpes:
         fig = go.Figure()
         fig.add_trace(go.Histogram(x=data.all_train_sharpes, name="train Sharpe, all trials"))
-        fig.add_vline(
-            x=data.expected_max_annual, line_dash="dash", annotation_text="expected max from noise"
-        )
+        if math.isfinite(data.expected_max_annual):
+            fig.add_vline(
+                x=data.expected_max_annual,
+                line_dash="dash",
+                annotation_text="expected max from noise",
+            )
         fig.update_layout(
             title="Luck distribution across trials",
             xaxis_title="train Sharpe (annualised)",
