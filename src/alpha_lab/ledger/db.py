@@ -121,7 +121,9 @@ MIGRATIONS = {
         "normalised_hash": "TEXT",
         "critic_json": "TEXT",
         "suspicion_level": "TEXT",
+        "train_returns_json": "TEXT",
     },
+    "validations": {"returns_json": "TEXT"},
 }
 
 
@@ -270,7 +272,13 @@ class Ledger:
         return self.conn.execute("SELECT COUNT(*) FROM trials").fetchone()[0]
 
     def add_validation(
-        self, attempt_id: str, run_id: str, metrics: dict | None, passed: bool, error: str | None
+        self,
+        attempt_id: str,
+        run_id: str,
+        metrics: dict | None,
+        passed: bool,
+        error: str | None,
+        returns: dict[str, float] | None = None,
     ) -> None:
         self._insert(
             "validations",
@@ -281,6 +289,7 @@ class Ledger:
                 "metrics_json": None if metrics is None else json.dumps(metrics),
                 "passed": int(passed),
                 "error": error,
+                "returns_json": None if returns is None else json.dumps(returns),
                 "created_at": now_iso(),
             },
         )
@@ -334,3 +343,40 @@ class Ledger:
             "SELECT rowid AS seq, * FROM events WHERE rowid > ? ORDER BY rowid LIMIT ?",
             (rowid, limit),
         ).fetchall()
+
+    # Holdout runs. One row per signal, ever. Written before any holdout price is read.
+    def add_holdout(
+        self,
+        holdout_id: str,
+        attempt_id: str,
+        run_id: str,
+        status: str,
+        metrics: dict | None,
+    ) -> None:
+        self._insert(
+            "holdout_runs",
+            {
+                "holdout_id": holdout_id,
+                "attempt_id": attempt_id,
+                "run_id": run_id,
+                "metrics_json": None if metrics is None else json.dumps(metrics),
+                "status": status,
+                "created_at": now_iso(),
+            },
+        )
+
+    def update_holdout(self, attempt_id: str, status: str, metrics: dict | None) -> None:
+        self._update(
+            "holdout_runs",
+            "attempt_id",
+            attempt_id,
+            {"status": status, "metrics_json": None if metrics is None else json.dumps(metrics)},
+        )
+
+    def get_holdout(self, attempt_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM holdout_runs WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()
+
+    def holdouts(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM holdout_runs ORDER BY created_at").fetchall()

@@ -32,6 +32,7 @@ from alpha_lab.checks.static import static_check
 from alpha_lab.config import Settings
 from alpha_lab.events.bus import EventBus, PipelineEvent
 from alpha_lab.ledger.db import Ledger
+from alpha_lab.pipeline.validation import validate_signal
 
 IDEA_RETRIES_ON_DUPLICATE = 2
 
@@ -41,12 +42,14 @@ class PipelineContext:
     run_id: str
     settings: Settings
     train_prices: pd.DataFrame  # prices through train_end only
+    validation_prices: pd.DataFrame  # prices through validation_end, used after the loop only
     llm: LLMClient
     ledger: Ledger
     bus: EventBus
     idea_prompt: PromptSpec
     coder_prompt: PromptSpec
     critic_prompt: PromptSpec
+    idea_lock: asyncio.Lock
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,7 @@ class AttemptOutcome:
     failure: str | None = None
     metrics: dict[str, Any] | None = None
     critic: CriticOutput | None = None
+    attempt_id: str | None = None
 
 
 def code_hash(code: str) -> str:
@@ -94,44 +98,65 @@ def _emit(
     )
 
 
-async def _draft_unique_idea(ctx: PipelineContext, pipeline_id: str, theme: str) -> IdeaOutput:
-    """Ask for ideas until one is not a near-copy of the ledger. Rejected ones are logged."""
+async def _draft_unique_idea(
+    ctx: PipelineContext, pipeline_id: str, theme: str
+) -> tuple[IdeaOutput, str]:
+    """Draft an idea that is not a near-copy of the ledger, and record it.
+
+    Holds ctx.idea_lock across the draft, the duplicate check and the insert.
+    Without the lock, two pipelines could both pass the check with the same
+    idea before either one was written down.
+    """
     settings = ctx.settings
     threshold = settings.dedup.similarity_threshold
-    for _ in range(IDEA_RETRIES_ON_DUPLICATE + 1):
-        idea = await generate_idea(
-            ctx.llm,
-            prompt=ctx.idea_prompt,
-            model=settings.agents.ideas_model,
-            recent_ideas=list(ctx.ledger.recent_ideas(30)),
-            theme=theme,
-            pipeline_id=pipeline_id,
-        )
-        best_score, best_id = 0.0, None
-        for old in ctx.ledger.all_ideas():
-            score = idea_similarity(idea.name, idea.description, old["name"], old["description"])
-            if score > best_score:
-                best_score, best_id = score, old["idea_id"]
-        if best_score < threshold:
-            return idea
-        ctx.ledger.add_rejected_idea(
-            rejection_id=uuid.uuid4().hex,
-            run_id=ctx.run_id,
-            pipeline_id=pipeline_id,
-            name=idea.name,
-            similar_to_idea_id=best_id,
-            similarity=best_score,
-        )
-        _emit(
-            ctx,
-            "idea_rejected_duplicate",
-            "ideas",
-            pipeline_id,
-            None,
-            None,
-            "ideas",
-            {"name": idea.name, "similarity": round(best_score, 3), "threshold": threshold},
-        )
+    async with ctx.idea_lock:
+        for _ in range(IDEA_RETRIES_ON_DUPLICATE + 1):
+            idea = await generate_idea(
+                ctx.llm,
+                prompt=ctx.idea_prompt,
+                model=settings.agents.ideas_model,
+                recent_ideas=list(ctx.ledger.recent_ideas(30)),
+                theme=theme,
+                pipeline_id=pipeline_id,
+            )
+            best_score, best_id = 0.0, None
+            for old in ctx.ledger.all_ideas():
+                score = idea_similarity(
+                    idea.name, idea.description, old["name"], old["description"]
+                )
+                if score > best_score:
+                    best_score, best_id = score, old["idea_id"]
+            if best_score < threshold:
+                idea_id = uuid.uuid4().hex
+                ctx.ledger.add_idea(
+                    idea_id=idea_id,
+                    run_id=ctx.run_id,
+                    pipeline_id=pipeline_id,
+                    name=idea.name,
+                    hypothesis=idea.hypothesis,
+                    description=idea.description,
+                    expected_holding_period_days=idea.expected_holding_period_days,
+                    theme=theme,
+                )
+                return idea, idea_id
+            ctx.ledger.add_rejected_idea(
+                rejection_id=uuid.uuid4().hex,
+                run_id=ctx.run_id,
+                pipeline_id=pipeline_id,
+                name=idea.name,
+                similar_to_idea_id=best_id,
+                similarity=best_score,
+            )
+            _emit(
+                ctx,
+                "idea_rejected_duplicate",
+                "ideas",
+                pipeline_id,
+                None,
+                None,
+                "ideas",
+                {"name": idea.name, "similarity": round(best_score, 3), "threshold": threshold},
+            )
     raise StepFailed("ideas kept duplicating earlier ideas")
 
 
@@ -141,21 +166,10 @@ async def run_single_pipeline(ctx: PipelineContext, theme: str) -> PipelineResul
     _emit(ctx, "pipeline_started", "pipeline", pipeline_id, None, None, None, {"theme": theme})
 
     try:
-        idea = await _draft_unique_idea(ctx, pipeline_id, theme)
+        idea, idea_id = await _draft_unique_idea(ctx, pipeline_id, theme)
     except (StepFailed, ContextLimitExceeded) as exc:
         return _finish(ctx, pipeline_id, "failed_ideas", None, theme, 0, str(exc))
 
-    idea_id = uuid.uuid4().hex
-    ctx.ledger.add_idea(
-        idea_id=idea_id,
-        run_id=ctx.run_id,
-        pipeline_id=pipeline_id,
-        name=idea.name,
-        hypothesis=idea.hypothesis,
-        description=idea.description,
-        expected_holding_period_days=idea.expected_holding_period_days,
-        theme=theme,
-    )
     _emit(
         ctx,
         "idea_created",
@@ -188,11 +202,13 @@ async def run_single_pipeline(ctx: PipelineContext, theme: str) -> PipelineResul
 
     status = "failed"
     attempts = 0
+    last: AttemptOutcome | None = None
     max_attempts = settings.agents.max_revisions + 1
     for attempt_number in range(1, max_attempts + 1):
         attempts = attempt_number
         outcome = await _check_attempt(ctx, pipeline_id, idea_id, idea, code, attempt_number)
         status = outcome.status
+        last = outcome
         if status == "critic_pass":
             break
         if attempt_number == max_attempts:
@@ -225,6 +241,30 @@ async def run_single_pipeline(ctx: PipelineContext, theme: str) -> PipelineResul
         except (StepFailed, ContextLimitExceeded) as exc:
             return _finish(ctx, pipeline_id, "failed_coder", idea, theme, attempts, str(exc))
 
+    if status == "critic_pass" and last is not None and last.attempt_id is not None:
+        verdict = await asyncio.to_thread(
+            validate_signal, code.code, ctx.validation_prices, settings
+        )
+        ctx.ledger.add_validation(
+            last.attempt_id,
+            ctx.run_id,
+            verdict.metrics,
+            verdict.passed,
+            verdict.error,
+            verdict.returns,
+        )
+        status = "validation_pass" if verdict.passed else "validation_fail"
+        ctx.ledger.update_attempt(last.attempt_id, status=status)
+        _emit(
+            ctx,
+            "validation_result",
+            "validation",
+            pipeline_id,
+            idea_id,
+            attempts,
+            "validation",
+            {"passed": verdict.passed},
+        )
     return _finish(ctx, pipeline_id, status, idea, theme, attempts, None)
 
 
@@ -373,6 +413,12 @@ async def _check_attempt(
         settings.backtest,
     )
     metrics = {k: float(v) for k, v in asdict(result.metrics).items()}
+    ctx.ledger.update_attempt(
+        attempt_id,
+        train_returns_json=json.dumps(
+            {str(day.date()): float(v) for day, v in result.net_returns.items()}
+        ),
+    )
     emit("train_backtest", "train", metrics)
 
     gates = settings.gates
@@ -477,7 +523,9 @@ def _record(
         error=failure,
         train_metrics_json=None if metrics is None else json.dumps(metrics),
     )
-    return AttemptOutcome(status=status, failure=failure, metrics=metrics, critic=critic)
+    return AttemptOutcome(
+        status=status, failure=failure, metrics=metrics, critic=critic, attempt_id=attempt_id
+    )
 
 
 def _iso(value: pd.Timestamp | None) -> str | None:

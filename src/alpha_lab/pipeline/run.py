@@ -90,12 +90,14 @@ async def execute_run(
         run_id=run_id,
         settings=settings,
         train_prices=train_prices,
+        validation_prices=prices,
         llm=llm,
         ledger=ledger,
         bus=bus,
         idea_prompt=load_prompt(IDEAS_PROMPT),
         coder_prompt=load_prompt(CODER_PROMPT),
         critic_prompt=load_prompt(CRITIC_PROMPT),
+        idea_lock=asyncio.Lock(),
     )
 
     progress = SwarmProgress(total=n_pipelines, budget=budget)

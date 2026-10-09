@@ -26,6 +26,7 @@ def signal(prices: pd.DataFrame) -> pd.DataFrame:
 """
 GOOD2 = GOOD.replace("prices.shift(21)", "prices.shift(22)")
 IMPORTS_OS = "import os\n" + GOOD
+CRITIC_PASSED = ("critic_pass", "validation_pass", "validation_fail")
 LOW = {"concerns": [], "suspicion_level": "low", "suggested_change": "none"}
 HIGH = {
     "concerns": ["uses future data"],
@@ -143,7 +144,7 @@ def test_identical_code_across_pipelines_is_rejected_and_not_a_trial(tmp_path):
         idea_factory=idea_for,
     )
     summary = run(client, ledger, n=2, concurrency=1)
-    assert all(r.status == "critic_pass" for r in summary.results)
+    assert all(r.status in CRITIC_PASSED for r in summary.results)
     rejected = ledger.conn.execute(
         "SELECT COUNT(*) FROM attempts WHERE status = 'rejected_duplicate_code'"
     ).fetchone()[0]
@@ -168,7 +169,7 @@ def test_high_suspicion_from_critic_sends_the_coder_back(tmp_path):
         idea_factory=idea_for,
     )
     summary = run(client, ledger, n=1)
-    assert summary.results[0].status == "critic_pass"
+    assert summary.results[0].status in CRITIC_PASSED
     assert summary.results[0].attempts == 2
     first = ledger.attempts_for_run("r")[0]
     assert first["status"] == "failed_critic"

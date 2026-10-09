@@ -1,11 +1,20 @@
-"""Performance metrics for a daily net-return series. Risk-free rate is zero."""
+"""Performance metrics and the deflated Sharpe ratio. Risk-free rate is zero.
+
+Units: annualised_* functions return annual figures. The deflated Sharpe ratio
+works in per-period (daily) units, because the paper's formula is stated that way.
+"""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from statistics import NormalDist
 
 import numpy as np
 import pandas as pd
+
+EULER_GAMMA = 0.5772156649015329
+_NORMAL = NormalDist()
 
 
 @dataclass(frozen=True)
@@ -31,8 +40,8 @@ def compute_metrics(
     ann_return = total ** (annualization_days / n) - 1.0 if total > 0 else -1.0
 
     std = float(r.std(ddof=1))
-    ann_vol = std * np.sqrt(annualization_days)
-    sharpe = float(r.mean()) / std * np.sqrt(annualization_days) if std > 0 else float("nan")
+    ann_vol = std * math.sqrt(annualization_days)
+    sharpe = float(r.mean()) / std * math.sqrt(annualization_days) if std > 0 else float("nan")
 
     equity = (1.0 + r).cumprod()
     peak = np.maximum(equity.cummax(), 1.0)  # the curve starts at 1.0 before day one
@@ -49,6 +58,69 @@ def compute_metrics(
     )
 
 
-def deflated_sharpe_ratio(*args: object, **kwargs: object) -> float:
-    """Deflated Sharpe ratio (Bailey and López de Prado, 2014). Implemented in Phase 3."""
-    raise NotImplementedError("deflated Sharpe ratio is implemented in Phase 3")
+def expected_max_sharpe(n_trials: int, sharpe_variance: float) -> float:
+    """SR0: the Sharpe ratio the best of N pure-noise trials is expected to reach.
+
+    SR0 = sqrt(V) * [ (1 - g) * Z^-1(1 - 1/N) + g * Z^-1(1 - 1/(N e)) ]
+
+    V is the variance of the trials' Sharpe ratios, g is the Euler-Mascheroni
+    constant, Z^-1 is the inverse standard normal CDF and e is Euler's number.
+    The expression comes from the expected maximum of N independent normal draws.
+    """
+    if n_trials < 2:
+        return 0.0
+    first = _NORMAL.inv_cdf(1.0 - 1.0 / n_trials)
+    second = _NORMAL.inv_cdf(1.0 - 1.0 / (n_trials * math.e))
+    return math.sqrt(max(sharpe_variance, 0.0)) * (
+        (1.0 - EULER_GAMMA) * first + EULER_GAMMA * second
+    )
+
+
+def deflated_sharpe_ratio(
+    sharpe: float,
+    n_obs: int,
+    skew: float,
+    kurtosis: float,
+    n_trials: int,
+    sharpe_variance: float,
+) -> float:
+    """Deflated Sharpe ratio (Bailey and Lopez de Prado, 2014). Returns a probability in [0, 1].
+
+    DSR = Z[ (SR - SR0) * sqrt(T - 1) / sqrt(1 - g3 * SR + (g4 - 1) / 4 * SR^2) ]
+
+    Terms, all per-period (daily) and not annualised:
+      SR      the candidate's Sharpe ratio on its own returns
+      SR0     the best Sharpe expected from N noise trials (see expected_max_sharpe)
+      T       number of return observations
+      g3      skewness of the returns (0 for a normal distribution)
+      g4      kurtosis of the returns, NON-excess (3 for a normal distribution)
+      Z       the standard normal CDF
+
+    A DSR near 1 means the Sharpe is unlikely to be a lucky maximum over N trials.
+    A DSR near 0.5 means the candidate is indistinguishable from the best noise trial.
+    """
+    if n_obs < 2:
+        raise ValueError("need at least 2 observations")
+    sr0 = expected_max_sharpe(n_trials, sharpe_variance)
+    variance_term = 1.0 - skew * sharpe + (kurtosis - 1.0) / 4.0 * sharpe**2
+    if variance_term <= 0:
+        return float("nan")  # the normal approximation breaks down for extreme skew/kurtosis
+    z = (sharpe - sr0) * math.sqrt(n_obs - 1) / math.sqrt(variance_term)
+    return _NORMAL.cdf(z)
+
+
+def per_period_sharpe(returns: pd.Series) -> float:
+    std = float(returns.std(ddof=1))
+    return float(returns.mean()) / std if std > 0 else float("nan")
+
+
+def moments(returns: pd.Series) -> tuple[float, float]:
+    """Skewness and non-excess kurtosis (3 for a normal distribution)."""
+    r = returns.astype("float64")
+    centred = r - r.mean()
+    sigma = float(r.std(ddof=0))
+    if sigma == 0:
+        return 0.0, 3.0
+    skew = float((centred**3).mean() / sigma**3)
+    kurt = float((centred**4).mean() / sigma**4)
+    return skew, kurt

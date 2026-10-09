@@ -5,11 +5,14 @@ description = "Multi-agent trading-signal research harness (learning project)"
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=1.12.1",
+    "fastapi>=0.143.0",
     "numpy>=2.4.6",
     "pandas>=3.0.6",
+    "plotly>=7.1.0",
     "pyarrow>=25.0.1",
     "pydantic>=2.14.0",
     "typer>=0.27.3",
+    "uvicorn>=0.54.0",
     "yfinance>=1.7.0",
 ]
 

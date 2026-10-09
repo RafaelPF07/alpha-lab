@@ -48,7 +48,7 @@ def relaxed_settings():
     return settings.model_copy(
         update={
             "gates": GatesConfig(
-                min_train_sharpe=-100.0, min_validation_sharpe=0.3, max_turnover_daily=10.0
+                min_train_sharpe=-100.0, min_validation_sharpe=-100.0, max_turnover_daily=10.0
             )
         }
     )
@@ -103,7 +103,7 @@ def test_passing_pipeline_runs_end_to_end_and_keeps_validation_out(ledger):
     summary, client = run_with(responses, ledger)
 
     assert summary.status == "completed"
-    assert summary.results[0].status == "critic_pass"
+    assert summary.results[0].status == "validation_pass"
     assert summary.results[0].attempts == 1
     assert ledger.count_trials() == 1
     assert summary.total_cost_usd > 0
@@ -142,7 +142,7 @@ def test_static_failure_is_fed_back_to_the_coder(ledger):
     ]
     summary, client = run_with(responses, ledger)
 
-    assert summary.results[0].status == "critic_pass"
+    assert summary.results[0].status == "validation_pass"
     assert summary.results[0].attempts == 2
     revision_prompt = client.messages.calls[2]["messages"][0]["content"]
     assert "Static check failed" in revision_prompt
