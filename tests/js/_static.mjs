@@ -60,6 +60,21 @@ export async function loadStatic(relative) {
   return import(pathToFileURL(join(copy, "js", relative)).href);
 }
 
+// The same shape the server sends from /api/statuses and /api/limits. The tests load it the way a page does,
+// so no test depends on a status name the JavaScript itself has to know.
+// Mirrors statuses.py: a validation failure still passed the critic.
+export const FIXTURE_STATUSES = {
+  passed_critic: ["critic_pass", "validation_pass", "validation_fail"],
+  passed_validation: ["validation_pass"],
+  validation_verdicts: ["validation_pass", "validation_fail"],
+};
+export const FIXTURE_LIMITS = { pricing_tier_tokens: 100000, context_limit_tokens: 90000 };
+
+export async function useFixtureContract() {
+  const { normaliseStatuses, normaliseLimits, setContract } = await loadStatic("core/contract.js");
+  setContract({ ...normaliseStatuses(FIXTURE_STATUSES), ...normaliseLimits(FIXTURE_LIMITS) });
+}
+
 // A stand-in for a DOM element: enough for the modules to set text, attributes and listeners.
 export function fakeElement(extra = {}) {
   const attributes = new Map();

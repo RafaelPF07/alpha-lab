@@ -10,7 +10,7 @@ const STAGES = [
   ["lookahead", "lookahead", "lookahead"],
   ["train", "train", "train"],
   ["critic", "critic", "critic"],
-  ["validation", "validated", "validation"],
+  ["validation", "passed", "validation"],
 ];
 
 let chart = null;

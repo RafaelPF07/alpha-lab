@@ -1,4 +1,5 @@
 // Shared helpers for every chart: colours come from the design tokens, numbers are formatted once.
+import { isPassedOutcome } from "../core/contract.js";
 
 const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
@@ -44,7 +45,7 @@ export function agentColor(agent) {
 export function statusColor(status) {
   if (!status) return COLORS.status.running();
   if (status === "running") return COLORS.status.running();
-  if (status === "validation_pass" || status === "critic_pass") return COLORS.status.passed();
+  if (isPassedOutcome(status)) return COLORS.status.passed();
   if (status === "budget_stopped" || status === "interrupted") return COLORS.status.budget();
   if (status.startsWith("rejected")) return COLORS.status.rejected();
   return COLORS.status.failed();
@@ -54,7 +55,7 @@ export const fmtUsd = (x) => (x == null || !Number.isFinite(x) ? "n/a" : `$${x.t
 export const fmtPct = (x) => (x == null || !Number.isFinite(x) ? "n/a" : `${(x * 100).toFixed(2)}%`);
 export const fmtNum = (x, d = 3) => (x == null || !Number.isFinite(x) ? "n/a" : x.toFixed(d));
 
-// "1 validated signal", "3 validated signals".
+// "1 trial", "3 trials". Research wording goes through core/research_text.js, which never says "validated".
 export const plural = (n, word, pluralWord = `${word}s`) => `${n} ${n === 1 ? word : pluralWord}`;
 
 // Gives a chart container a text alternative for screen readers (FE-08).

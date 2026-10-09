@@ -2,7 +2,10 @@
 // hostile idea name, theme and status, and the test checks that no element is created.
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { loadStatic, installFakeEcharts, fakeElement } from "./_static.mjs";
+import { loadStatic, installFakeEcharts, fakeElement, useFixtureContract } from "./_static.mjs";
+
+// Charts that colour a status need the server's status sets, as a page loads them before drawing.
+await useFixtureContract();
 
 const HOSTILE = '<img src=x onerror="window.__xss=(window.__xss||0)+1">';
 const NOW = "2026-10-09T00:00:00.000+00:00";

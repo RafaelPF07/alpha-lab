@@ -1,24 +1,37 @@
 // Pipeline theatre: the canvas half. Plays the effects produced by theatre_model.js in real time.
 //
 // Every pipeline is drawn as a card with eight stations. Packets travel between stations as stages
-// complete, stations light up or fail, revision loops arc back to the coder, and each finished
-// pipeline bursts green (passed) or red (failed). While the run is busy the loop runs at display rate,
-// so the hub and the card glows keep breathing. With prefers-reduced-motion the ambient animation stops,
-// and the loop redraws only when something changes: state changes stay visible, the motion does not.
+// complete, stations light up or fail, revision loops arc back to the coder, and each finished pipeline
+// bursts green (passed) or red (failed). Finished cards are dimmed, never removed.
+//
+// A page opened in the middle of a run gets the backlog in one batch. Those events update each card's
+// visual state at once, without animation, so every pipeline is drawn in its current state (R3-FE-01).
+//
+// The canvas redraws only when something changes. While a run is live, the ambient motion (hub pulse,
+// card breathing, stars) runs at up to ten frames a second. With prefers-reduced-motion it stops, and the
+// stage still redraws on every state change (R3-FE-02).
+//
+// When a run has more pipelines than the normal card grid holds, the stage switches to compact cards.
+// Pipelines that still do not fit are counted in the header, not drawn (R3-FE-03).
 import { STAGES, IDLE, ACTIVE, OK, FAIL, TIMING, TheatreModel, truncate } from "./theatre_model.js";
 import { prefersReducedMotion } from "./common.js";
+import { isPassedOutcome } from "../core/contract.js";
 
-const CARD_H = 146;
-const GAP = 18;
 const HEADER_H = 92;
 const PAD = 22;
-const TRACK_Y = 92; // station row, relative to the card top
-const MIN_CARD_W = 252;
-const MAX_CARD_W = 320;
 const MIN_WIDTH = 280;
 const MIN_HEIGHT = 240;
-const MAX_LIVE_EVENTS = 60; // a backlog larger than this is fast-forwarded without animation
-const IDLE_REDRAW_MS = 250; // with reduced motion, how often the still picture is redrawn
+const MAX_LIVE_EVENTS = 60; // a backlog larger than this is applied without animation
+const IDLE_FRAME_MS = 100; // ambient motion while the run is live: at most ten frames a second
+const FINISHED_ALPHA = 0.6; // finished cards are dimmed, not removed
+export const CANVAS_MUTED = "#9aa4b8"; // readable on the card body (about 6:1); used for all canvas labels
+const TEXT_MIN_PX = 10; // no canvas text is smaller than this (R3-FE-06)
+const FIT_CACHE_MAX = 4000;
+
+// Two card sizes. The normal size is used while every pipeline fits. The compact size is used when the run
+// has more pipelines than the normal grid holds.
+const NORMAL = { compact: false, cardH: 146, gap: 18, minW: 252, maxW: 320, trackY: 92 };
+const COMPACT = { compact: true, cardH: 64, gap: 10, minW: 140, maxW: 200, trackY: 34 };
 
 function cssVar(name, fallback) {
   const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -75,6 +88,9 @@ export class PipelineTheatre {
     this.colors = {};
     this.dirty = true; // something changed since the last draw
     this.lastDraw = 0;
+    this.hiddenCount = 0; // pipelines in the run that the stage cannot show
+    this.frameIndex = new Map(); // pipeline id -> card rectangle, rebuilt on every draw
+    this.fitCache = new Map();
     this.reduceMotion = prefersReducedMotion();
     this.stars = Array.from({ length: 70 }, (_, i) => ({
       x: ((i * 9301 + 49297) % 233280) / 233280,
@@ -112,6 +128,8 @@ export class PipelineTheatre {
     this.bursts = [];
     this.hubText = null;
     this.hover = null;
+    this.hiddenCount = 0;
+    this.frameIndex = new Map();
     this.dirty = true;
   }
 
@@ -152,45 +170,88 @@ export class PipelineTheatre {
     this.dirty = true;
   }
 
-  // Feed a batch of events from the stream. Large backlogs are fast-forwarded.
+  // Feed a batch of events from the stream.
+  //
+  // Only the last MAX_LIVE_EVENTS are animated. Older events in the batch (a backlog) are applied to the
+  // model and copied into each card's visual state at once, so no pipeline is missing from the stage.
+  // Animations still queued from earlier batches are applied first, so they cannot overwrite newer state.
   ingest(events) {
     const now = performance.now();
     const cut = Math.max(0, events.length - MAX_LIVE_EVENTS);
+    if (cut > 0) this.flushQueue(now);
     for (let i = 0; i < events.length; i++) {
-      const animate = i >= cut;
-      const effects = this.model.apply(events[i], animate);
+      if (i < cut) {
+        this.model.apply(events[i], false);
+        this.syncVisual(events[i].pipeline_id, now);
+        continue;
+      }
+      const effects = this.model.apply(events[i], true);
       for (const effect of effects) this.queue.push({ due: now + (effect.at || 0), effect });
     }
     this.dirty = true;
   }
 
+  // Applies every queued effect that changes state (spawn, node, stale, status) at once, and drops the
+  // motion effects (packets, floats, bursts, arcs, shakes). The state effects are then overridden by
+  // syncVisual, so this only decides how a backlog starts.
+  flushQueue(now) {
+    const pending = this.queue;
+    this.queue = [];
+    for (const item of pending) {
+      const { type } = item.effect;
+      if (type === "spawn" || type === "node" || type === "stale" || type === "status") this.applyEffect(item.effect, now);
+    }
+  }
+
+  // Copies the model's current state for one pipeline into its visual card, with no animation.
+  syncVisual(pid, now) {
+    const card = pid ? this.model.cards.get(pid) : null;
+    if (!card) return;
+    // A card created here is treated as already grown, so it does not play its entrance animation.
+    const v = this.ensureVCard(pid, now - 1000);
+    v.nodes = card.stations.map((s) => ({ state: s.state, text: s.text || "", flashAt: -1, stale: Boolean(s.stale) }));
+    v.status = card.status;
+  }
+
   // ----- layout ---------------------------------------------------------------------------
 
-  // Cards stretch to fill the width, within sensible minimum and maximum sizes.
+  // The normal grid when every pipeline fits in it, otherwise the compact grid.
   layout() {
+    const normal = this.gridFor(NORMAL);
+    if (this.model.order.length <= normal.capacity) return normal;
+    return this.gridFor(COMPACT);
+  }
+
+  // Cards stretch to fill the width, within the size's minimum and maximum width.
+  gridFor(size) {
     const usableW = this.width - PAD * 2;
-    const cols = Math.max(1, Math.floor((usableW + GAP) / (MIN_CARD_W + GAP)));
-    const cardW = Math.min(MAX_CARD_W, (usableW - (cols - 1) * GAP) / cols);
-    const rows = Math.max(1, Math.floor((this.height - HEADER_H - PAD + GAP) / (CARD_H + GAP)));
-    const gridW = cols * cardW + (cols - 1) * GAP;
+    const cols = Math.max(1, Math.floor((usableW + size.gap) / (size.minW + size.gap)));
+    const cardW = Math.min(size.maxW, (usableW - (cols - 1) * size.gap) / cols);
+    const rows = Math.max(1, Math.floor((this.height - HEADER_H - PAD + size.gap) / (size.cardH + size.gap)));
+    const gridW = cols * cardW + (cols - 1) * size.gap;
     const left = PAD + Math.max(0, (usableW - gridW) / 2);
-    return { cols, rows, left, top: HEADER_H, capacity: cols * rows, cardW };
+    return {
+      compact: size.compact, cols, rows, left, top: HEADER_H, capacity: cols * rows, cardW,
+      cardH: size.cardH, gap: size.gap, trackY: size.trackY,
+    };
   }
 
   cardRect(index, layout) {
     const col = index % layout.cols;
     const row = Math.floor(index / layout.cols);
     return {
-      x: layout.left + col * (layout.cardW + GAP),
-      y: layout.top + row * (CARD_H + GAP),
+      x: layout.left + col * (layout.cardW + layout.gap),
+      y: layout.top + row * (layout.cardH + layout.gap),
       w: layout.cardW,
-      h: CARD_H,
+      h: layout.cardH,
+      compact: layout.compact,
+      trackY: layout.trackY,
     };
   }
 
   stationPos(rect, index) {
     const inner = rect.w - 48;
-    return { x: rect.x + 24 + (index * inner) / (STAGES.length - 1), y: rect.y + TRACK_Y };
+    return { x: rect.x + 24 + (index * inner) / (STAGES.length - 1), y: rect.y + rect.trackY };
   }
 
   hubPos() {
@@ -210,6 +271,23 @@ export class PipelineTheatre {
       if (cards[i] && this.inside(point, this.cardRect(i, layout))) return cards[i];
     }
     return null;
+  }
+
+  // Text is measured once per font and width. The cache is cleared when it grows too large.
+  fit(text, maxWidth) {
+    const key = `${this.ctx.font}|${maxWidth}|${text}`;
+    let value = this.fitCache.get(key);
+    if (value === undefined) {
+      if (this.fitCache.size >= FIT_CACHE_MAX) this.fitCache.clear();
+      value = fitText(this.ctx, text, maxWidth);
+      this.fitCache.set(key, value);
+    }
+    return value;
+  }
+
+  // Whether the ambient motion runs: only while the run is live, and not with reduced motion.
+  ambient() {
+    return !this.reduceMotion && this.model.runStatus === "running";
   }
 
   // ----- effects -------------------------------------------------------------------------
@@ -307,7 +385,10 @@ export class PipelineTheatre {
 
     const busy = this.queue.length > 0 || this.packets.length > 0 || this.arcs.length > 0
       || this.floats.length > 0 || this.bursts.length > 0 || Boolean(this.hubText && now - this.hubText.start < 2600);
-    if (this.reduceMotion && !busy && !this.dirty && now - this.lastDraw < IDLE_REDRAW_MS) return;
+    // Nothing changed: skip the draw. A live run keeps its ambient motion, at a capped rate.
+    if (!busy && !this.dirty) {
+      if (!this.ambient() || now - this.lastDraw < IDLE_FRAME_MS) return;
+    }
     this.lastDraw = now;
     this.dirty = false;
 
@@ -318,21 +399,33 @@ export class PipelineTheatre {
 
     const layout = this.layout();
     const cards = this.model.visibleCards(layout.capacity);
+    this.hiddenCount = this.model.order.length - cards.length;
+    this.frameIndex = new Map();
     this.hover = null;
     cards.forEach((card, index) => {
+      const rect = this.cardRect(index, layout);
+      this.frameIndex.set(card.id, rect);
       const v = this.vcards.get(card.id);
       if (!v) return;
-      const rect = this.cardRect(index, layout);
-      this.drawCard(card, v, rect, now);
+      try {
+        this.drawCard(card, v, rect, now);
+      } catch (err) {
+        // One card with bad data is skipped, so the others still draw and the frame is not lost (R4-FE-09).
+        // The canvas state is restored in case the card stopped inside its own save().
+        this.ctx.restore();
+        if (!this.cardErrorLogged) {
+          this.cardErrorLogged = true;
+          console.error("A pipeline card could not be drawn and was skipped. Further card errors are not logged.", err);
+        }
+      }
       if (this.mouse && this.inside(this.mouse, rect)) this.hover = { ...card, rect };
     });
-    const archived = this.model.order.length - cards.length;
-    this.drawHub(now, archived);
+    this.drawHub(now, this.hiddenCount);
 
-    this.drawPackets(now, layout);
-    this.drawArcs(now, layout);
-    this.drawFloats(now, layout);
-    this.drawBursts(now, layout);
+    this.drawPackets(now);
+    this.drawArcs(now);
+    this.drawFloats(now);
+    this.drawBursts(now);
     if (this.hover) this.drawTooltip(this.hover);
   }
 
@@ -367,9 +460,10 @@ export class PipelineTheatre {
     for (let x = 14; x < this.width; x += 28) {
       for (let y = 14; y < this.height; y += 28) ctx.fillRect(x, y, 1.2, 1.2);
     }
-    // Stars that twinkle slowly. With reduced motion they stay still.
+    // Stars that twinkle slowly while the run is live. Otherwise they stay still.
+    const twinkle = this.ambient();
     for (const s of this.stars) {
-      const wave = this.reduceMotion ? 0 : Math.sin(now / 900 + s.p);
+      const wave = twinkle ? Math.sin(now / 900 + s.p) : 0;
       const alpha = 0.12 + 0.12 * wave;
       ctx.fillStyle = `rgba(200,215,255,${alpha.toFixed(3)})`;
       ctx.beginPath();
@@ -378,11 +472,12 @@ export class PipelineTheatre {
     }
   }
 
-  drawHub(now, archived) {
+  drawHub(now, hidden) {
     const ctx = this.ctx;
     const { x, y } = this.hubPos();
     const stats = this.model.stats();
-    const pulse = this.reduceMotion ? 0.5 : 0.5 + 0.5 * Math.sin(now / 420);
+    const live = this.ambient();
+    const pulse = live ? 0.5 + 0.5 * Math.sin(now / 420) : 0.5;
 
     // Halo.
     const halo = ctx.createRadialGradient(x, y, 6, x, y, 58);
@@ -393,9 +488,9 @@ export class PipelineTheatre {
     ctx.arc(x, y, 58, 0, Math.PI * 2);
     ctx.fill();
 
-    // Orbiting dots, one per running pipeline up to twelve. With reduced motion they stay where they are.
+    // Orbiting dots, one per running pipeline up to twelve. They move only while the run is live.
     const orbiting = Math.min(12, stats.running);
-    const turn = this.reduceMotion ? 0 : now / 1100;
+    const turn = live ? now / 1100 : 0;
     for (let i = 0; i < orbiting; i++) {
       const a = turn + (i / Math.max(1, orbiting)) * Math.PI * 2;
       ctx.fillStyle = hexToRgba(this.stageColor[0], 0.9);
@@ -421,8 +516,8 @@ export class PipelineTheatre {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(String(stats.running), x, y);
-    ctx.fillStyle = this.colors.muted;
-    ctx.font = "10px system-ui, sans-serif";
+    ctx.fillStyle = CANVAS_MUTED;
+    ctx.font = `${TEXT_MIN_PX}px system-ui, sans-serif`;
     ctx.fillText("running", x, y + 40);
 
     // Headline text next to the hub. Every line is fitted to the space to the right of the hub.
@@ -432,13 +527,14 @@ export class PipelineTheatre {
     ctx.fillStyle = this.colors.text;
     ctx.font = "600 15px system-ui, sans-serif";
     const total = stats.total ?? "?";
-    ctx.fillText(fitText(ctx, `${stats.done} of ${total} pipelines`, avail), 86, 34);
+    ctx.fillText(this.fit(`${stats.done} of ${total} pipelines`, avail), 86, 34);
     ctx.font = "12px system-ui, sans-serif";
-    ctx.fillStyle = this.colors.muted;
-    const tail = [`${stats.passed} passed`, `$${stats.spent.toFixed(3)}${stats.budget ? ` of $${stats.budget.toFixed(2)}` : ""}`];
+    ctx.fillStyle = CANVAS_MUTED;
+    const tail = [`${stats.passed} passed critic · ${stats.validated} passed validation`,
+      `$${stats.spent.toFixed(3)}${stats.budget ? ` of $${stats.budget.toFixed(2)}` : ""}`];
     if (stats.duplicates) tail.push(`${stats.duplicates} duplicate ideas rejected`);
-    if (archived > 0) tail.push(`${archived} earlier pipelines archived`);
-    ctx.fillText(fitText(ctx, tail.join("  ·  "), avail), 86, 54);
+    if (hidden > 0) tail.push(`${hidden} not shown on the stage`);
+    ctx.fillText(this.fit(tail.join("  ·  "), avail), 86, 54);
 
     // Progress bar across the header.
     const barW = Math.max(120, this.width - 86 - PAD);
@@ -458,7 +554,7 @@ export class PipelineTheatre {
       ctx.fillStyle = this.toneColor(this.hubText.tone);
       ctx.font = "600 12px system-ui, sans-serif";
       ctx.textAlign = "right";
-      ctx.fillText(fitText(ctx, this.hubText.text, avail), this.width - PAD, 18);
+      ctx.fillText(this.fit(this.hubText.text, avail), this.width - PAD, 18);
       ctx.globalAlpha = 1;
       ctx.textAlign = "left";
     }
@@ -471,19 +567,38 @@ export class PipelineTheatre {
     return this.colors.muted;
   }
 
-  drawCard(card, v, rect, now) {
-    const ctx = this.ctx;
-    const age = now - v.spawnAt;
-    const appear = this.reduceMotion ? 1 : Math.min(1, Math.max(0, age / 380));
+  // The border and its soft outer line. Running cards breathe; passed and failed finished cards are fixed.
+  cardBorder(v, finished, passed, now) {
+    if (!finished) {
+      const breathe = this.reduceMotion ? 0.5 : 0.5 + 0.5 * Math.sin(now / 600 + (v.spawnAt % 97));
+      return { border: hexToRgba(this.stageColor[0], 0.3 + 0.35 * breathe), glow: hexToRgba(this.stageColor[0], 0.14 * breathe) };
+    }
+    if (passed) return { border: hexToRgba(this.colors.ok, 0.75), glow: hexToRgba(this.colors.ok, 0.18) };
+    return { border: hexToRgba(this.colors.fail, 0.45), glow: null };
+  }
+
+  // Shake after a failure, and the entrance animation. Both stop with reduced motion.
+  cardMotion(v, now) {
+    const appear = this.reduceMotion ? 1 : Math.min(1, Math.max(0, (now - v.spawnAt) / 380));
     const eased = 1 - Math.pow(1 - appear, 3);
     let dx = 0;
     if (!this.reduceMotion && v.shakeAt >= 0 && now - v.shakeAt < 520) {
       const t = (now - v.shakeAt) / 520;
       dx = 7 * Math.sin(t * 42) * Math.exp(-t * 5);
     }
+    return { eased, dx };
+  }
+
+  drawCard(card, v, rect, now) {
+    if (rect.compact) {
+      this.drawCompactCard(card, v, rect, now);
+      return;
+    }
+    const ctx = this.ctx;
+    const { eased, dx } = this.cardMotion(v, now);
     const finished = v.status !== "running";
-    const failedDone = finished && !PASSED(v.status);
-    const alpha = (failedDone ? 0.55 : 1) * eased;
+    const passed = finished && isPassedOutcome(v.status);
+    const alpha = (finished ? FINISHED_ALPHA : 1) * eased;
     const lift = (1 - eased) * 14;
     const x = rect.x + dx;
     const y = rect.y + lift;
@@ -499,35 +614,28 @@ export class PipelineTheatre {
     roundRect(ctx, x, y, rect.w, rect.h, 14);
     ctx.fill();
 
-    // Border: breathing while running, green for passes, red for failures.
-    let border = hexToRgba(this.stageColor[0], 0.28);
-    let glow = null;
-    if (!finished) {
-      const breathe = this.reduceMotion ? 0.5 : 0.5 + 0.5 * Math.sin(now / 600 + (v.spawnAt % 97));
-      border = hexToRgba(this.stageColor[0], 0.3 + 0.35 * breathe);
-      glow = hexToRgba(this.stageColor[0], 0.25 * breathe);
-    } else if (PASSED(v.status)) {
-      border = hexToRgba(this.colors.ok, 0.75);
-      glow = hexToRgba(this.colors.ok, 0.35);
-    } else {
-      border = hexToRgba(this.colors.fail, 0.45);
+    // Border, with a wider faint line under it for the glow (no shadow blur: that is expensive per frame).
+    const { border, glow } = this.cardBorder(v, finished, passed, now);
+    if (glow) {
+      ctx.strokeStyle = glow;
+      ctx.lineWidth = 6;
+      roundRect(ctx, x, y, rect.w, rect.h, 14);
+      ctx.stroke();
     }
     ctx.strokeStyle = border;
     ctx.lineWidth = 1.2;
-    if (glow) { ctx.shadowColor = glow; ctx.shadowBlur = 16; }
     roundRect(ctx, x, y, rect.w, rect.h, 14);
     ctx.stroke();
-    ctx.shadowBlur = 0;
 
     // Header: short id, theme pill, attempt.
-    ctx.fillStyle = this.colors.muted;
-    ctx.font = "500 10px ui-monospace, Consolas, monospace";
+    ctx.fillStyle = CANVAS_MUTED;
+    ctx.font = `500 ${TEXT_MIN_PX}px ui-monospace, Consolas, monospace`;
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
     ctx.fillText(`#${card.short}`, x + 14, y + 17);
     if (card.theme) {
-      ctx.font = "600 9.5px system-ui, sans-serif";
-      const label = card.theme.toUpperCase();
+      ctx.font = `600 ${TEXT_MIN_PX}px system-ui, sans-serif`;
+      const label = this.fit(card.theme.toUpperCase(), rect.w - 110);
       const tw = ctx.measureText(label).width + 14;
       const tx = x + rect.w - 14 - tw;
       ctx.fillStyle = hexToRgba(this.stageColor[0], 0.14);
@@ -540,14 +648,14 @@ export class PipelineTheatre {
     ctx.textAlign = "left";
     if (card.attempt > 1) {
       ctx.fillStyle = this.colors.warn;
-      ctx.font = "600 9.5px system-ui, sans-serif";
+      ctx.font = `600 ${TEXT_MIN_PX}px system-ui, sans-serif`;
       ctx.fillText(`try ${card.attempt}`, x + 14 + 56, y + 17);
     }
 
     // Idea name.
     ctx.fillStyle = this.colors.text;
     ctx.font = "600 12.5px system-ui, sans-serif";
-    ctx.fillText(fitText(ctx, card.idea || "generating idea…", rect.w - 28), x + 14, y + 40);
+    ctx.fillText(this.fit(card.idea || "generating idea…", rect.w - 28), x + 14, y + 40);
 
     // Track.
     const stations = STAGES.map((_, i) => this.stationPos(rect, i));
@@ -567,7 +675,7 @@ export class PipelineTheatre {
     const spacing = (rect.w - 48) / (STAGES.length - 1);
     STAGES.forEach((stage, i) => {
       const node = v.nodes[i];
-      ctx.globalAlpha = node.stale ? 0.38 : 1;
+      ctx.globalAlpha = (node.stale ? 0.38 : 1) * alpha;
       const sx = stations[i].x + dx;
       const sy = stations[i].y - (rect.y - y);
       const color = this.stageColor[i];
@@ -581,42 +689,36 @@ export class PipelineTheatre {
         ctx.arc(sx, sy, ring, 0, Math.PI * 2);
         ctx.stroke();
       }
+      // A soft disc behind lit stations stands in for a shadow blur.
+      const halo = haloFor(node.state, color, this.colors.fail);
+      if (halo) {
+        ctx.fillStyle = hexToRgba(halo.color, halo.alpha);
+        ctx.beginPath();
+        ctx.arc(sx, sy, halo.radius * pop, 0, Math.PI * 2);
+        ctx.fill();
+      }
       ctx.beginPath();
       ctx.arc(sx, sy, 6.5 * pop, 0, Math.PI * 2);
-      if (node.state === OK) {
-        ctx.fillStyle = color;
-        ctx.shadowColor = hexToRgba(color, 0.7);
-        ctx.shadowBlur = 10;
-      } else if (node.state === ACTIVE) {
-        ctx.fillStyle = color;
-        ctx.shadowColor = hexToRgba(color, 0.9);
-        ctx.shadowBlur = 14;
-      } else if (node.state === FAIL) {
-        ctx.fillStyle = this.colors.fail;
-        ctx.shadowColor = hexToRgba(this.colors.fail, 0.7);
-        ctx.shadowBlur = 10;
-      } else {
-        ctx.fillStyle = "#0e1424";
-      }
+      if (node.state === OK || node.state === ACTIVE) ctx.fillStyle = color;
+      else if (node.state === FAIL) ctx.fillStyle = this.colors.fail;
+      else ctx.fillStyle = "#0e1424";
       ctx.fill();
-      ctx.shadowBlur = 0;
       ctx.strokeStyle = node.state === IDLE ? "rgba(120,130,160,0.5)" : "rgba(255,255,255,0.18)";
       ctx.lineWidth = 1;
       ctx.stroke();
 
-      // Station value above, label below.
+      // Station value above, label below. Both are at least TEXT_MIN_PX.
       if (node.text) {
-        ctx.fillStyle = node.state === FAIL ? this.colors.fail : this.colors.muted;
-        ctx.font = "500 8.5px ui-monospace, Consolas, monospace";
+        ctx.fillStyle = node.state === FAIL ? this.colors.fail : CANVAS_MUTED;
+        ctx.font = `600 ${TEXT_MIN_PX}px system-ui, sans-serif`;
         ctx.textAlign = "center";
-        const value = fitText(ctx, truncate(node.text, 10), spacing - 4);
+        const value = this.fit(truncate(node.text, 12), spacing - 1);
         if (value) ctx.fillText(value, sx, sy - 14);
       }
-      ctx.fillStyle = node.state === IDLE ? "rgba(138,148,168,0.6)" : node.state === FAIL ? this.colors.fail : color;
-      ctx.font = "600 7.5px system-ui, sans-serif";
+      ctx.fillStyle = node.state === IDLE ? CANVAS_MUTED : node.state === FAIL ? this.colors.fail : color;
+      ctx.font = `600 ${TEXT_MIN_PX}px system-ui, sans-serif`;
       ctx.textAlign = "center";
-      if (ctx.measureText(stage.short).width > spacing - 2) ctx.font = "600 6.5px system-ui, sans-serif";
-      const label = fitText(ctx, stage.short, spacing - 2);
+      const label = this.fit(stage.short, spacing - 1);
       if (label) ctx.fillText(label, sx, sy + 20);
       ctx.globalAlpha = alpha;
     });
@@ -625,25 +727,109 @@ export class PipelineTheatre {
     // Result badge in the footer when the pipeline has finished.
     if (finished) {
       const label = card.status.replace(/_/g, " ");
-      ctx.font = "600 9.5px system-ui, sans-serif";
+      ctx.font = `600 ${TEXT_MIN_PX}px system-ui, sans-serif`;
       const bw = ctx.measureText(label).width + 16;
       const bx = x + 14;
       const by = y + rect.h - 22;
-      ctx.fillStyle = PASSED(v.status) ? hexToRgba(this.colors.ok, 0.18) : hexToRgba(this.colors.fail, 0.16);
+      ctx.fillStyle = passed ? hexToRgba(this.colors.ok, 0.18) : hexToRgba(this.colors.fail, 0.16);
       roundRect(ctx, bx, by, bw, 15, 7.5);
       ctx.fill();
-      ctx.fillStyle = PASSED(v.status) ? this.colors.ok : this.colors.fail;
+      ctx.fillStyle = passed ? this.colors.ok : this.colors.fail;
       ctx.textBaseline = "middle";
       ctx.fillText(label, bx + 8, by + 8);
     }
     ctx.restore();
   }
 
-  drawPackets(now, layout) {
+  // A small card for large runs: id and status, a row of station dots, and the idea name. No station text.
+  drawCompactCard(card, v, rect, now) {
+    const ctx = this.ctx;
+    const { eased, dx } = this.cardMotion(v, now);
+    const finished = v.status !== "running";
+    const passed = finished && isPassedOutcome(v.status);
+    const alpha = (finished ? FINISHED_ALPHA : 1) * eased;
+    const lift = (1 - eased) * 10;
+    const x = rect.x + dx;
+    const y = rect.y + lift;
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    const body = ctx.createLinearGradient(x, y, x, y + rect.h);
+    body.addColorStop(0, "#161d2f");
+    body.addColorStop(1, "#0d1220");
+    ctx.fillStyle = body;
+    roundRect(ctx, x, y, rect.w, rect.h, 10);
+    ctx.fill();
+    const { border } = this.cardBorder(v, finished, passed, now);
+    ctx.strokeStyle = border;
+    ctx.lineWidth = 1.2;
+    roundRect(ctx, x, y, rect.w, rect.h, 10);
+    ctx.stroke();
+
+    // Header: id on the left, status (or "running") on the right.
+    ctx.textBaseline = "middle";
+    ctx.font = `500 ${TEXT_MIN_PX}px ui-monospace, Consolas, monospace`;
+    ctx.fillStyle = CANVAS_MUTED;
+    ctx.textAlign = "left";
+    ctx.fillText(`#${card.short}`, x + 10, y + 13);
+    ctx.font = `600 ${TEXT_MIN_PX}px system-ui, sans-serif`;
+    ctx.textAlign = "right";
+    if (finished) {
+      ctx.fillStyle = passed ? this.colors.ok : this.colors.fail;
+      ctx.fillText(this.fit(card.status.replace(/_/g, " "), rect.w * 0.55), x + rect.w - 10, y + 13);
+    } else {
+      ctx.fillStyle = this.stageColor[0];
+      ctx.fillText("running", x + rect.w - 10, y + 13);
+    }
+
+    // Station dots, no labels. Lit stations are filled and carry a halo.
+    const stations = STAGES.map((_, i) => this.stationPos(rect, i));
+    const shift = rect.y - y;
+    for (let i = 0; i < STAGES.length - 1; i++) {
+      const a = v.nodes[i];
+      const b = v.nodes[i + 1];
+      const lit = (a.state === OK || a.state === ACTIVE) && b.state !== IDLE;
+      ctx.strokeStyle = lit ? hexToRgba(this.stageColor[i + 1], 0.85) : "rgba(120,130,160,0.22)";
+      ctx.lineWidth = lit ? 2 : 1.2;
+      ctx.beginPath();
+      ctx.moveTo(stations[i].x + dx, stations[i].y - shift);
+      ctx.lineTo(stations[i + 1].x + dx, stations[i + 1].y - shift);
+      ctx.stroke();
+    }
+    STAGES.forEach((_, i) => {
+      const node = v.nodes[i];
+      const sx = stations[i].x + dx;
+      const sy = stations[i].y - shift;
+      const color = this.stageColor[i];
+      const halo = haloFor(node.state, color, this.colors.fail);
+      if (halo) {
+        ctx.fillStyle = hexToRgba(halo.color, halo.alpha);
+        ctx.beginPath();
+        ctx.arc(sx, sy, halo.radius * 0.8, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.beginPath();
+      ctx.arc(sx, sy, 4, 0, Math.PI * 2);
+      if (node.state === OK || node.state === ACTIVE) ctx.fillStyle = color;
+      else if (node.state === FAIL) ctx.fillStyle = this.colors.fail;
+      else ctx.fillStyle = "#0e1424";
+      ctx.fill();
+    });
+
+    // The idea name, fitted to the card.
+    ctx.textBaseline = "alphabetic";
+    ctx.textAlign = "left";
+    ctx.fillStyle = this.colors.text;
+    ctx.font = `600 ${TEXT_MIN_PX}px system-ui, sans-serif`;
+    ctx.fillText(this.fit(card.idea || "generating idea…", rect.w - 20), x + 10, y + 52);
+    ctx.restore();
+  }
+
+  drawPackets(now) {
     const ctx = this.ctx;
     for (const p of this.packets) {
       const t = easeInOut(Math.min(1, Math.max(0, (now - p.start) / p.dur)));
-      const rect = this.findRect(p.pid, layout);
+      const rect = this.findRect(p.pid);
       if (!rect) continue;
       const from = p.from === "hub" ? this.hubPos() : this.stationPos(rect.rect, p.from);
       const to = p.to === "card" ? { x: rect.rect.x + rect.rect.w / 2, y: rect.rect.y + 6 } : this.stationPos(rect.rect, p.to);
@@ -661,21 +847,24 @@ export class PipelineTheatre {
         ctx.arc(tx, ty, 3.2 * (1 - k / 8), 0, Math.PI * 2);
         ctx.fill();
       }
-      ctx.shadowColor = hexToRgba(color, 0.9);
-      ctx.shadowBlur = 14;
+      // The packet, with a soft disc behind it.
+      ctx.fillStyle = hexToRgba(color, 0.25);
+      ctx.beginPath();
+      ctx.arc(x, y, 7, 0, Math.PI * 2);
+      ctx.fill();
       ctx.fillStyle = color;
       ctx.beginPath();
       ctx.arc(x, y, 3.8, 0, Math.PI * 2);
       ctx.fill();
-      ctx.shadowBlur = 0;
     }
   }
 
-  drawArcs(now, layout) {
+  // Revision loops are drawn on the normal cards only. A compact card shows the failed station as a red dot.
+  drawArcs(now) {
     const ctx = this.ctx;
     for (const a of this.arcs) {
-      const rect = this.findRect(a.pid, layout);
-      if (!rect) continue;
+      const rect = this.findRect(a.pid);
+      if (!rect || rect.rect.compact) continue;
       const from = this.stationPos(rect.rect, a.from);
       const to = this.stationPos(rect.rect, a.to);
       const t = easeInOut(Math.min(1, Math.max(0, (now - a.start) / a.dur)));
@@ -694,38 +883,40 @@ export class PipelineTheatre {
       // The packet riding the loop back to the coder.
       const px = (1 - t) * (1 - t) * from.x + 2 * (1 - t) * t * cx + t * t * to.x;
       const py = (1 - t) * (1 - t) * (from.y + 8) + 2 * (1 - t) * t * cy + t * t * (to.y + 8);
-      ctx.shadowColor = hexToRgba(this.colors.warn, 0.9);
-      ctx.shadowBlur = 12;
+      ctx.fillStyle = hexToRgba(this.colors.warn, 0.25);
+      ctx.beginPath();
+      ctx.arc(px, py, 7, 0, Math.PI * 2);
+      ctx.fill();
       ctx.fillStyle = this.colors.warn;
       ctx.beginPath();
       ctx.arc(px, py, 3.6, 0, Math.PI * 2);
       ctx.fill();
-      ctx.shadowBlur = 0;
     }
   }
 
-  drawFloats(now, layout) {
+  // Floats rise a little from the station's value row. They are not drawn on compact cards.
+  drawFloats(now) {
     const ctx = this.ctx;
     ctx.textAlign = "center";
     for (const f of this.floats) {
-      const rect = this.findRect(f.pid, layout);
-      if (!rect) continue;
+      const rect = this.findRect(f.pid);
+      if (!rect || rect.rect.compact) continue;
       const t = (now - f.start) / 1100;
       const pos = f.index >= 0 ? this.stationPos(rect.rect, f.index) : { x: rect.rect.x + rect.rect.w / 2, y: rect.rect.y };
       ctx.globalAlpha = Math.max(0, 1 - t);
       ctx.fillStyle = this.toneColor(f.tone);
-      ctx.font = "600 10px ui-monospace, Consolas, monospace";
-      const text = fitText(ctx, f.text, (rect.rect.w - 48) / (STAGES.length - 1) * 2 - 4);
-      if (text) ctx.fillText(text, pos.x, pos.y - 26 - t * 22);
+      ctx.font = `600 ${TEXT_MIN_PX}px ui-monospace, Consolas, monospace`;
+      const text = this.fit(f.text, (rect.rect.w - 48) / (STAGES.length - 1) * 2 - 4);
+      if (text) ctx.fillText(text, pos.x, pos.y - 30 - t * 12);
     }
     ctx.globalAlpha = 1;
     ctx.textAlign = "left";
   }
 
-  drawBursts(now, layout) {
+  drawBursts(now) {
     const ctx = this.ctx;
     for (const b of this.bursts) {
-      const rect = this.findRect(b.pid, layout);
+      const rect = this.findRect(b.pid);
       if (!rect) continue;
       const t = (now - b.start) / 900;
       const cx = rect.rect.x + rect.rect.w / 2;
@@ -780,16 +971,19 @@ export class PipelineTheatre {
     });
   }
 
-  findRect(pid, layout) {
-    const cards = this.model.visibleCards(layout.capacity);
-    const index = cards.findIndex((c) => c && c.id === pid);
-    if (index < 0) return null;
-    return { rect: this.cardRect(index, layout) };
+  // The rectangle of a pipeline's card in the current frame, or null when it is not on the stage.
+  findRect(pid) {
+    const rect = this.frameIndex.get(pid);
+    return rect ? { rect } : null;
   }
 }
 
-function PASSED(status) {
-  return status === "critic_pass" || status === "validation_pass";
+// The soft disc drawn behind a lit station or a packet. Idle stations have none.
+function haloFor(state, color, failColor) {
+  if (state === OK) return { color, alpha: 0.28, radius: 9 };
+  if (state === ACTIVE) return { color, alpha: 0.35, radius: 11 };
+  if (state === FAIL) return { color: failColor, alpha: 0.3, radius: 9 };
+  return null;
 }
 
 function roundRect(ctx, x, y, w, h, r) {

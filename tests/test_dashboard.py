@@ -7,6 +7,7 @@ import asyncio
 import dataclasses
 import json
 import uuid
+from datetime import UTC, datetime
 from typing import get_args
 
 import numpy as np
@@ -14,7 +15,10 @@ import pandas as pd
 import pytest
 
 from alpha_lab.backtest.metrics import Metrics, compute_metrics
+from alpha_lab.config import load_settings
 from alpha_lab.dashboard import queries
+from alpha_lab.data.loader import PRE_HOLDOUT_FILE
+from alpha_lab.events import demo
 from alpha_lab.events.bus import EventBus, EventType, PipelineEvent
 from alpha_lab.events.demo import DEMO_RUN_ID, run_demo
 from alpha_lab.ledger.db import LEDGER_PATH, Ledger
@@ -23,7 +27,13 @@ from alpha_lab.ledger.db import LEDGER_PATH, Ledger
 # pipeline/run.py, agents/llm.py and checks/lookahead.py. train_backtest carries the Metrics fields.
 REAL_PAYLOAD_KEYS = {
     "run_started": {"pipelines", "budget_usd", "concurrency"},
-    "run_finished": {"status", "total_cost_usd"},
+    "run_finished": {
+        "status",
+        "total_cost_usd",
+        "budget_usd",
+        "reserved_usd",
+        "data_failed_pipelines",
+    },
     "pipeline_started": {"theme"},
     "pipeline_finished": {"status", "attempts", "error", "theme"},
     "idea_created": {"name", "hypothesis", "description", "expected_holding_period_days", "theme"},
@@ -41,6 +51,8 @@ REAL_PAYLOAD_KEYS = {
     "code_written": {"code_hash", "lines"},
     "duplicate_code": {"earlier_attempt_id", "message"},
     "llm_call_refused": {"call_id", "model", "reason", "estimated_cost_usd"},
+    "llm_call_retrying": {"call_id", "attempt", "delay_seconds", "error_type"},
+    "budget_overrun": {"spent_usd", "limit_usd"},
     "static_check": {"ok", "errors", "warnings"},
     "sandbox_run": {"status", "error_type", "message"},
     "lookahead_check": {"test", "passed", "cutoff", "first_offending_date", "ticker"},
@@ -130,7 +142,11 @@ def test_demo_payloads_have_the_real_event_keys(big_demo):
         )
         assert set(payload) == REAL_PAYLOAD_KEYS[row["type"]], row["type"]
         seen.add(row["type"])
-    assert seen == set(get_args(EventType)), "the demo should exercise every event type"
+    # budget_overrun needs the run to spend past its budget. The default demo spends about 0.24 of its
+    # 2 USD, so it does not emit that type. Its keys are still checked against the table above.
+    assert seen == set(get_args(EventType)) - {"budget_overrun"}, (
+        "the demo should exercise every event type it can"
+    )
 
 
 def test_demo_has_one_started_and_one_finished_pipeline_per_idea(small_demo):
@@ -243,7 +259,8 @@ def test_recorded_holdout_metrics_appear_only_after_completion(tmp_path):
     point = points[0]
     attempt_id = point["attempt_id"]
     ledger.add_holdout("h1", attempt_id, DEMO_RUN_ID, "running", None)
-    assert queries.signal_detail(ledger, attempt_id)["holdout"] == {"status": "running"}
+    assert queries.signal_detail(ledger, attempt_id)["holdout"]["status"] == "running"
+    assert "metrics" not in queries.signal_detail(ledger, attempt_id)["holdout"]
     ledger.update_holdout(attempt_id, "complete", {"sharpe": 0.4})
     assert queries.signal_detail(ledger, attempt_id)["holdout"]["metrics"] == {"sharpe": 0.4}
     ledger.close()
@@ -337,7 +354,8 @@ def test_equity_is_thinned_but_keeps_the_deepest_drawdown(tmp_path):
     rng = np.random.default_rng(5)
     days = pd.bdate_range("2019-01-01", periods=1500)
     validation = {
-        str(d.date()): float(v) for d, v in zip(days, rng.normal(0.0002, 0.01, len(days)))
+        str(d.date()): float(v)
+        for d, v in zip(days, rng.normal(0.0002, 0.01, len(days)), strict=True)
     }
     ledger = new_ledger(tmp_path)
     add_candidate(ledger, "Candidate", train=None, validation=validation)
@@ -396,3 +414,305 @@ def test_timeline_segments_are_the_llm_calls_that_were_sent_or_refused(small_dem
     assert segments, "the demo makes LLM calls, so there should be segments"
     assert len(segments) == len(calls)
     assert {s["status"] for s in segments} <= {"ok", "refused"}
+
+
+def test_demo_prices_and_models_come_from_the_settings(tmp_path, monkeypatch):
+    base = load_settings()
+    haiku = base.pricing.models["claude-haiku-5-5"].model_copy(update={"input": 3.0, "output": 4.0})
+    models = {**base.pricing.models, "claude-haiku-5-5": haiku}
+    priced = base.model_copy(update={"pricing": base.pricing.model_copy(update={"models": models})})
+    monkeypatch.setattr(demo, "load_settings", lambda: priced)
+    ledger = Ledger(tmp_path / "demo.db")
+    asyncio.run(run_demo(ledger, EventBus(ledger), n_pipelines=8, pace=0.0, seed=3))
+    rows = ledger.conn.execute(
+        "SELECT model, input_tokens, output_tokens, cost_usd FROM llm_calls "
+        "WHERE run_id = ? AND status = 'ok'",
+        (DEMO_RUN_ID,),
+    ).fetchall()
+    ledger.close()
+    assert {r["model"] for r in rows} == {
+        base.agents.ideas_model,
+        base.agents.critic_model,
+        base.agents.coder_model,
+    }
+    haiku_rows = [r for r in rows if r["model"] == "claude-haiku-5-5"]
+    assert haiku_rows, "the demo should price some Haiku calls"
+    for r in haiku_rows:
+        expected = (r["input_tokens"] * 3.0 + r["output_tokens"] * 4.0) / 1_000_000
+        assert r["cost_usd"] == pytest.approx(expected)
+
+
+def test_a_reached_critic_with_no_usable_review_counts_as_a_train_pass(tmp_path):
+    # failed_critic_output is written after the training gate, so the summary counts it as a train pass.
+    ledger = new_ledger(tmp_path)
+    add_candidate(ledger, "No review", train=None, validation=None, status="failed_critic_output")
+    add_candidate(ledger, "Gate failed", train=None, validation=None, status="failed_gate")
+    add_candidate(ledger, "Validated", train=None, validation=None, status="validation_pass")
+    summary = queries.run_summary(ledger, "r1")
+    # One vocabulary (statuses.py): counts of distinct ideas, named after the set they count (R4-WHOLE-10).
+    assert summary["passed_train_gate"] == 2, "the critic-output case and the validated one"
+    assert summary["passed_critic"] == 1, "only the validated idea passed the critic"
+    assert summary["passed_validation"] == 1
+    assert "train_passes" not in summary and "validation_passes" not in summary
+    ledger.close()
+
+
+def test_equity_and_signal_payloads_say_why_the_dsr_is_missing(tmp_path):
+    ledger = new_ledger(tmp_path)
+    attempt_id = add_candidate(
+        ledger,
+        "Lone candidate",
+        train={"2018-01-02": 0.01, "2018-01-03": -0.01},
+        validation={"2019-01-02": 0.0, "2019-01-03": 0.01, "2019-01-04": -0.01},
+    )
+    curve = queries.equity(ledger, "r1", top=1)[0]
+    assert "two trials" in curve["dsr_reason"], "one trial cannot estimate the trial variance"
+    assert queries.signal_detail(ledger, attempt_id)["dsr_reason"] == curve["dsr_reason"]
+    ledger.close()
+
+
+def test_the_limits_come_from_the_settings():
+    settings = load_settings()
+    assert queries.limits() == {
+        "pricing_tier_tokens": settings.pricing.long_context_threshold_tokens,
+        "context_limit_tokens": settings.agents.context_limit_tokens,
+    }
+    assert queries.limits() == {"pricing_tier_tokens": 100000, "context_limit_tokens": 90000}
+
+
+def test_benchmark_refuses_a_price_cache_built_for_other_settings(tmp_path, monkeypatch):
+    monkeypatch.setattr(queries, "DATA_DIR", tmp_path)
+    prices = pd.DataFrame(
+        {"AAPL": [100.0, 101.0]}, index=pd.to_datetime(["2019-01-02", "2019-01-03"])
+    )
+    prices.to_parquet(tmp_path / PRE_HOLDOUT_FILE)  # a cache with no fingerprint
+    result = queries.equal_weight_benchmark(["2019-01-02", "2019-01-03"])
+    assert result["dates"] == []
+    assert result["equity"] == []
+    assert result["reason"].startswith("cache stale")
+    assert "different settings" in result["reason"]
+
+
+def test_a_finished_run_is_rebuilt_when_a_row_changes_but_the_counts_do_not(tmp_path, monkeypatch):
+    ledger = demo_ledger(tmp_path)
+    builds = []
+    original = queries.build_report_data
+
+    def counting(led, run_id, *args, **kwargs):
+        builds.append(run_id)
+        return original(led, run_id, *args, **kwargs)
+
+    monkeypatch.setattr(queries, "build_report_data", counting)
+    queries.research(ledger, DEMO_RUN_ID)
+    assert len(builds) == 1
+    # Add one validation and remove the oldest: the row count is unchanged, but the newest rowid moves on.
+    old_validation = ledger.conn.execute(
+        "SELECT validation_id FROM validations ORDER BY rowid LIMIT 1"
+    ).fetchone()[0]
+    unvalidated = ledger.conn.execute(
+        "SELECT attempt_id FROM attempts WHERE run_id = ? AND attempt_id NOT IN "
+        "(SELECT attempt_id FROM validations) LIMIT 1",
+        (DEMO_RUN_ID,),
+    ).fetchone()
+    assert unvalidated is not None, "the demo should have an attempt with no validation row"
+    ledger.add_validation(unvalidated[0], DEMO_RUN_ID, {"sharpe": 0.9}, True, None, None)
+    ledger.conn.execute("DELETE FROM validations WHERE validation_id = ?", (old_validation,))
+    ledger.conn.commit()
+    queries.research(ledger, DEMO_RUN_ID)
+    assert len(builds) == 2, "a replaced row must not be served from the old cache entry"
+    ledger.close()
+
+
+def test_the_report_cache_is_bounded_by_candidates_as_well_as_entries(tmp_path, monkeypatch):
+    queries._report_cache.clear()  # other tests share the module-level cache
+    ledger = demo_ledger(tmp_path)
+    weight = len(queries.report_for(ledger, DEMO_RUN_ID).candidates)
+    assert weight >= 1
+    ledger.create_run("second", "{}", 1.0)
+    ledger.finish_run("second", "completed", 0.0)
+    # The demo run is cached with a weight equal to the budget. Caching the second run pushes the
+    # total over the budget, so the demo run is evicted and must be built again when it is asked for.
+    monkeypatch.setattr(queries, "REPORT_CACHE_CANDIDATES", weight)
+    queries.report_for(ledger, "second")
+    assert len(queries._report_cache) == 1, "the older entry was evicted by the candidate budget"
+    builds = []
+    original = queries.build_report_data
+
+    def counting(led, run_id, *args, **kwargs):
+        builds.append(run_id)
+        return original(led, run_id, *args, **kwargs)
+
+    monkeypatch.setattr(queries, "build_report_data", counting)
+    queries.report_for(ledger, DEMO_RUN_ID)
+    queries.report_for(ledger, DEMO_RUN_ID)  # cached again, because the budget holds one entry
+    assert builds == [DEMO_RUN_ID], "the second request is served from the cache"
+    ledger.close()
+
+
+def test_a_holdout_left_running_for_hours_is_marked_stale(tmp_path):
+    ledger = demo_ledger(tmp_path, pipelines=20)
+    attempt_id = queries.galaxy(ledger, DEMO_RUN_ID)["points"][0]["attempt_id"]
+    ledger.add_holdout("h-old", attempt_id, DEMO_RUN_ID, "running", None)
+    ledger.conn.execute(
+        "UPDATE holdout_runs SET created_at = ? WHERE attempt_id = ?",
+        ("2020-01-01T00:00:00.000+00:00", attempt_id),
+    )
+    ledger.conn.commit()
+    holdout = queries.signal_detail(ledger, attempt_id)["holdout"]
+    assert holdout["status"] == "running"
+    assert holdout["stale"] is True, "a running row years old was probably left by a killed process"
+    assert holdout["started_at"] == "2020-01-01T00:00:00.000+00:00"
+    ledger.conn.execute(
+        "UPDATE holdout_runs SET created_at = ? WHERE attempt_id = ?",
+        (datetime.now(UTC).isoformat(), attempt_id),
+    )
+    ledger.conn.commit()
+    assert queries.signal_detail(ledger, attempt_id)["holdout"]["stale"] is False
+    ledger.close()
+
+
+def test_a_running_run_silent_for_longer_than_the_stale_limit_is_flagged(tmp_path):
+    ledger = Ledger(tmp_path / "stale.db")
+    ledger.create_run("dead", "{}", 1.0)
+    ledger.create_run("live", "{}", 1.0)
+    for run_id, when in (
+        ("dead", "2020-01-01T00:00:00.000+00:00"),
+        ("live", datetime.now(UTC).isoformat()),
+    ):
+        ledger.conn.execute(
+            "INSERT INTO events (event_id, run_id, stage, type, timestamp, payload_json) "
+            "VALUES (?, ?, 'run', 'run_started', ?, '{}')",
+            (uuid.uuid4().hex, run_id, when),
+        )
+    ledger.conn.commit()
+    rows = {r["run_id"]: r for r in queries.list_runs(ledger)}
+    assert {k: r["status"] for k, r in rows.items()} == {"dead": "abandoned", "live": "running"}
+    assert rows["dead"]["stored_status"] == "running", (
+        "the ledger still stores the dead run as running"
+    )
+    # 'abandoned' is a final status, so it never carries stale: true (R4-BE-06 and the R5 stale rule).
+    assert rows["dead"]["stale"] is False
+    assert rows["live"]["stale"] is False
+    assert queries.run_summary(ledger, "dead")["status"] == "abandoned"
+    assert queries.run_summary(ledger, "dead")["stale"] is False
+    assert queries.run_summary(ledger, "live")["stale"] is False
+    ledger.close()
+
+
+def test_the_demo_writes_run_finished_through_the_shared_payload(tmp_path, monkeypatch):
+    calls = []
+    shared = demo.run_finished_payload
+
+    def spy(**kwargs):
+        calls.append(kwargs)
+        return shared(**kwargs)
+
+    monkeypatch.setattr(demo, "run_finished_payload", spy)
+    ledger = demo_ledger(tmp_path)
+    ledger.close()
+    assert len(calls) == 1
+    assert calls[0]["status"] == "completed"
+
+
+def test_the_demo_and_the_stream_use_the_status_sets_from_statuses_py():
+    from alpha_lab import statuses
+    from alpha_lab.dashboard import server
+
+    assert demo.LOOP_ENDS == statuses.VALIDATION_VERDICTS
+    assert server.ENDED_RUN_STATUSES == statuses.RUN_STATUSES - {"running"}
+
+
+def test_a_silent_run_keeps_its_stored_running_status_and_is_not_stale(tmp_path):
+    ledger = Ledger(tmp_path / "flags.db")
+    old = "2020-01-01T00:00:00.000+00:00"
+    for run_id, stored in (("final", "abandoned"), ("dead", "running")):
+        ledger.create_run(run_id, "{}", 1.0)
+        ledger.conn.execute(
+            "INSERT INTO events (event_id, run_id, stage, type, timestamp, payload_json) "
+            "VALUES (?, ?, 'run', 'run_started', ?, '{}')",
+            (uuid.uuid4().hex, run_id, old),
+        )
+        if stored != "running":
+            ledger.finish_run(run_id, stored, 0.0)
+    ledger.conn.commit()
+    rows = {r["run_id"]: r for r in queries.list_runs(ledger)}
+    assert rows["final"]["status"] == "abandoned"
+    assert rows["final"]["stored_status"] == "abandoned"
+    assert rows["final"]["stale"] is False, "a final stored status is never stale"
+    assert rows["dead"]["status"] == "abandoned"
+    assert rows["dead"]["stored_status"] == "running"
+    assert rows["dead"]["stale"] is False, "abandoned is final, so it never carries stale"
+    assert queries.run_summary(ledger, "final")["stale"] is False
+    ledger.close()
+
+
+def test_no_run_status_that_is_final_carries_stale(tmp_path):
+    """Every status a reader can show for a run is checked: only a non-final status may carry stale."""
+    ledger = Ledger(tmp_path / "every.db")
+    old = "2020-01-01T00:00:00.000+00:00"
+    for run_id in ("silent", "done"):
+        ledger.create_run(run_id, "{}", 1.0)
+        ledger.conn.execute(
+            "INSERT INTO events (event_id, run_id, stage, type, timestamp, payload_json) "
+            "VALUES (?, ?, 'run', 'run_started', ?, '{}')",
+            (uuid.uuid4().hex, run_id, old),
+        )
+    ledger.finish_run("done", "completed", 0.0)
+    ledger.conn.commit()
+    for row in queries.list_runs(ledger):
+        final = row["status"] != "running"
+        assert not (final and row["stale"]), row
+    ledger.close()
+
+
+def test_equity_thinning_never_exceeds_max_points():
+    # 1000 points, the deepest drawdown at index 1 (off the even grid): it must replace a grid point.
+    kept = queries._thin(1000, 1, 500)
+    assert len(kept) <= 500
+    assert {0, 999, 1} <= set(kept)
+    # When the deepest point is already on the grid, the output is exactly max_points.
+    assert len(queries._thin(1000, 0, 500)) == 500
+
+
+def test_the_report_key_does_not_read_the_metrics_column(tmp_path):
+    """The cache key runs on every request, so it may use only indexed counts and maxima (R4-BE-05)."""
+    ledger = demo_ledger(tmp_path, pipelines=20)
+    statements: list[str] = []
+    ledger.conn.set_trace_callback(statements.append)
+    queries._report_key(ledger, DEMO_RUN_ID)
+    ledger.conn.set_trace_callback(None)
+    assert statements, "the key should run at least one statement"
+    assert not any("train_metrics_json" in s for s in statements), statements
+    ledger.close()
+
+
+def test_the_holdout_statuses_come_from_statuses_py(tmp_path):
+    from alpha_lab import statuses
+
+    sets = queries.status_sets()
+    assert sets["holdout"] == sorted(statuses.HOLDOUT_VIEWS)
+    assert set(statuses.HOLDOUT_VIEWS) == set(statuses.HOLDOUT_STATUSES) | {
+        statuses.HOLDOUT_LOCKED_VIEW
+    }
+    ledger = demo_ledger(tmp_path, pipelines=20)
+    attempt_id = queries.galaxy(ledger, DEMO_RUN_ID)["points"][0]["attempt_id"]
+    ledger.add_holdout("h-state", attempt_id, DEMO_RUN_ID, "running", None)
+    assert queries.signal_detail(ledger, attempt_id)["holdout"]["status"] in sets["holdout"]
+    ledger.finish_holdout(attempt_id, "error", None, None)
+    assert queries.signal_detail(ledger, attempt_id)["holdout"]["status"] == "error"
+    assert queries.signal_detail(ledger, attempt_id)["holdout"]["status"] in sets["holdout"]
+    ledger.close()
+
+
+def test_galaxy_points_carry_their_status_and_equity_curves_their_passed_flag(big_demo):
+    from alpha_lab import statuses
+
+    points = {p["attempt_id"]: p for p in queries.galaxy(big_demo, DEMO_RUN_ID)["points"]}
+    assert points, "the demo should contain validated candidates"
+    for point in points.values():
+        assert point["status"] in statuses.ATTEMPT_STATUSES
+    curves = queries.equity(big_demo, DEMO_RUN_ID, top=5)
+    assert curves
+    for curve in curves:
+        assert isinstance(curve["passed"], bool)
+        assert curve["passed"] == points[curve["attempt_id"]]["passed"]

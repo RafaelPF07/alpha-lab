@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'">
   <title>Alpha Lab · Live pipelines</title>
+  <link rel="icon" href="/favicon.ico" type="image/svg+xml">
   <link rel="stylesheet" href="/static/css/tokens.css">
   <link rel="stylesheet" href="/static/css/live.css">
 </head>
@@ -29,24 +30,29 @@
     </nav>
   </header>
 
-  <section class="stats" aria-label="Run totals">
-    <div class="stat"><span class="stat-value" id="stat-running">0</span><span class="stat-label">running</span></div>
-    <div class="stat"><span class="stat-value" id="stat-done">0</span><span class="stat-label">finished</span></div>
-    <div class="stat stat-ok"><span class="stat-value" id="stat-passed">0</span><span class="stat-label">passed the gate</span></div>
-    <div class="stat stat-warn"><span class="stat-value" id="stat-dupes">0</span><span class="stat-label">duplicates caught</span></div>
-    <div class="stat stat-budget"><span class="stat-value" id="stat-spent">$0.0000</span><span class="stat-label" id="stat-budget">of budget</span></div>
-    <div class="progress" aria-hidden="true"><div class="progress-fill" id="progress-fill"></div></div>
-  </section>
-
   <main class="live-main">
+    <section class="stats" aria-label="Run totals">
+      <div class="stat"><span class="stat-value" id="stat-running">0</span><span class="stat-label">running</span></div>
+      <div class="stat"><span class="stat-value" id="stat-done">0</span><span class="stat-label">finished</span></div>
+      <div class="stat stat-ok"><span class="stat-value" id="stat-passed">0 / 0</span><span class="stat-label">passed critic / validation</span></div>
+      <div class="stat stat-warn"><span class="stat-value" id="stat-dupes">0</span><span class="stat-label">duplicates caught</span></div>
+      <div class="stat stat-budget"><span class="stat-value" id="stat-spent">$0.0000</span><span class="stat-label" id="stat-budget">of budget</span></div>
+      <div class="progress" aria-hidden="true"><div class="progress-fill" id="progress-fill"></div></div>
+    </section>
+
     <section class="stage-wrap" aria-labelledby="stage-title">
       <div class="stage-head">
         <h2 id="stage-title">Pipelines in flight</h2>
-        <p class="hint">Each card is one pipeline. Packets are results moving between stations. Hover a card for details, click it to open the signal inspector. From the keyboard, use the live feed.</p>
+        <p class="hint">Each card is one pipeline. Packets are results moving between stations. Hover a card for details, click it to open the signal inspector. Keyboard users: the list below the stage links to the same pipelines.</p>
       </div>
       <div class="stage" id="stage-frame">
         <canvas id="stage" role="img" aria-label="Animated view of pipelines moving through the research stages"></canvas>
       </div>
+      <p id="stage-summary" class="stage-summary" aria-live="polite"></p>
+      <details class="pipeline-list-wrap">
+        <summary>Pipelines as a list</summary>
+        <ul id="pipeline-list" class="pipeline-list" aria-label="Pipelines with an idea, as links"></ul>
+      </details>
       <ol class="stations" aria-label="Stations in order">
         <li style="--c: var(--stage-idea)">idea</li>
         <li style="--c: var(--stage-code)">code</li>

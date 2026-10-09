@@ -1,8 +1,11 @@
 // Mission control: live view of a run (or the demo run). Every chart reads the same aggregated state.
-import { fetchJson, connectStream } from "../core/api.js";
+import { connectStream } from "../core/api.js";
+import { loadContract, contract } from "../core/contract.js";
+import { RunStatuses, idleLabel, statusLabel } from "../core/runstatus.js";
 import { RunState } from "../core/state.js";
 import { isDemoRun } from "../core/runs.js";
-import { showError, requireCharts } from "../core/page.js";
+import { showError, clearError, requireCharts } from "../core/page.js";
+import { checkLedger, loadFailure } from "../core/ledgerprobe.js";
 import * as counters from "../viz/counters.js";
 import * as funnel from "../viz/funnel.js";
 import * as swimlanes from "../viz/swimlanes.js";
@@ -21,18 +24,63 @@ let stop = null;
 let scheduled = false;
 let currentRun = null;
 let connection = { state: "connecting", delay: 0 };
+let problem = null; // the reason the server gives when it cannot read the current run's events (R4-FE-01)
+const runs = new RunStatuses(); // each run's status as the server reports it
+const NO_RUNS_HINT = "no runs yet. Start one with: uv run lab run --pipelines 5 --budget 0.50";
 
+// The status line shows the run's status as the server reports it. While the server says the run is live,
+// the line also counts the running pipelines from the events.
 function updateStatusLine() {
   const el = $("run-status");
-  if (connection.state === "reconnecting") {
-    el.textContent = `connection lost, retrying in ${Math.round(connection.delay / 1000)} s`;
-  } else if (state.finished) {
-    el.textContent = `finished · ${state.runStatus || "done"}`;
-  } else if (connection.state === "connecting") {
-    el.textContent = "connecting…";
-  } else {
-    el.textContent = `live · ${state.runningPipelines} running`;
+  // With no run selected, the line says whether the server has listed any runs yet (R4-FE-04).
+  if (!currentRun) {
+    const idle = idleLabel(runs.answered, runs.list.length).text;
+    el.textContent = runs.answered && runs.list.length === 0 ? NO_RUNS_HINT : idle;
+    return;
   }
+  const label = statusLabel(runs.get(currentRun), connection.state, connection.delay, problem);
+  el.textContent = label.text === "live" ? `live · ${state.runningPipelines} running` : label.text;
+}
+
+async function refreshRuns() {
+  try {
+    await runs.refresh();
+    renderRunSelect();
+  } catch {
+    // Keep the last answer. The status line still shows the stream's state.
+  }
+  updateStatusLine();
+}
+
+// Asks the server whether the current run's events can be read. A stream cannot say so, so the page must ask (R4-FE-01).
+async function checkRun(runId) {
+  const found = await checkLedger(runId);
+  if (runId !== currentRun) return;
+  if (found) {
+    problem = found;
+    showError(found);
+  } else if (problem) {
+    if (document.getElementById("page-error")?.textContent === problem) clearError();
+    problem = null;
+  }
+  updateStatusLine();
+}
+
+function runOptionText(runId) {
+  const info = runs.get(runId);
+  return `${runId} · ${info?.status ?? "unknown"}${info?.stale && info.status === "running" ? " · stale" : ""}`;
+}
+
+// The run select is rebuilt from the server's list, keeping the run on screen selected.
+function renderRunSelect() {
+  const select = $("run-select");
+  select.replaceChildren(...runs.list.map((r) => {
+    const option = document.createElement("option");
+    option.value = r.run_id;
+    option.textContent = runOptionText(r.run_id);
+    return option;
+  }));
+  if (currentRun && runs.get(currentRun)) select.value = currentRun;
 }
 
 function render() {
@@ -63,6 +111,7 @@ function scheduleRender() {
 function attach(runId) {
   if (stop) stop();
   currentRun = runId;
+  problem = null;
   state = new RunState(runId);
   connection = { state: "connecting", delay: 0 };
   $("demo-badge").hidden = !isDemoRun(runId);
@@ -75,13 +124,22 @@ function attach(runId) {
     onStatus: (status, detail) => {
       if (detail.runId !== currentRun) return;
       connection = { state: status, delay: detail.delay ?? 0 };
+      if (status === "finished") refreshRuns();
       updateStatusLine();
     },
   });
   scheduleRender();
+  checkRun(runId);
 }
 
 async function init() {
+  // The status sets and the thresholds come from the server before any chart is drawn (DECISION-13).
+  try {
+    await loadContract();
+  } catch (err) {
+    showError(`Could not load the dashboard settings. ${err.message}`);
+    return;
+  }
   try {
     requireCharts();
     counters.init($("counters"));
@@ -90,8 +148,9 @@ async function init() {
     gauge.init($("gauge"));
     spend.init($("spend"));
     stack.init($("spend-stack"));
-    // Thresholds of the pricing tier and the context limit, as set in config/settings.toml.
-    context.init($("context"), { pricingThreshold: 100000, contextLimit: 90000 });
+    // Thresholds of the pricing tier and the context limit, as set in config/settings.toml, served by the API.
+    const limits = contract();
+    context.init($("context"), { pricingThreshold: limits.pricingTierTokens, contextLimit: limits.contextLimitTokens });
     ticker.init($("ticker"));
     swarm.init($("swarm"));
   } catch (err) {
@@ -116,26 +175,28 @@ async function init() {
     $("run-status").textContent = `pipeline ${String(e.detail).slice(0, 8)} has no idea yet`;
   });
 
+  // The run select is wired before the first request, so a failed run list still leaves run switching working (R4-FE-05).
+  const select = $("run-select");
+  select.addEventListener("change", () => attach(select.value));
   try {
-    const runs = await fetchJson("/api/runs");
-    const select = $("run-select");
-    for (const r of runs) {
-      const opt = document.createElement("option");
-      opt.value = r.run_id;
-      opt.textContent = `${r.run_id} · ${r.status}`;
-      select.appendChild(opt);
-    }
-    const chosen = params.get("run") || (runs[0] && runs[0].run_id);
+    await runs.refresh();
+    renderRunSelect();
+    const chosen = params.get("run") || (runs.list[0] && runs.list[0].run_id);
     if (chosen) {
       select.value = chosen;
       attach(chosen);
-    } else {
-      $("run-status").textContent = "no runs yet. Start one with: uv run lab run --pipelines 5 --budget 0.50";
     }
-    select.addEventListener("change", () => attach(select.value));
   } catch (err) {
-    showError(`Could not load the run list. ${err.message}`);
+    showError(loadFailure("Could not load the run list", err));
   }
+  updateStatusLine();
 }
+
+// The run list is refreshed from the server every few seconds, so the status line follows the server, and the
+// run's readability is checked again (R4-FE-01).
+setInterval(() => {
+  refreshRuns();
+  if (currentRun) checkRun(currentRun);
+}, 15000);
 
 init();

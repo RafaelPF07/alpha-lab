@@ -1,9 +1,10 @@
 // Run state (static/js/core/state.js): the numbers every mission-control chart reads.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { loadStatic } from "./_static.mjs";
+import { loadStatic, useFixtureContract } from "./_static.mjs";
 
-const { RunState } = await loadStatic("core/state.js");
+const { RunState, SERIES_MAX } = await loadStatic("core/state.js");
+await useFixtureContract();
 
 let seq = 0;
 const ev = (type, { pid = null, idea = null, agent = null, payload = {}, run, ts } = {}) => ({
@@ -141,5 +142,35 @@ describe("RunState ticker, runs and money", () => {
     s.ingest(ev("pipeline_started", { pid: "p1", payload: { theme: "momentum" } }));
     s.ingest(ev("idea_created", { pid: "p1", idea: "a", payload: { name: "Twelve month winners" } }));
     assert.equal(s.pipelines.get("p1").ideaId, "a");
+  });
+});
+
+describe("RunState keeps its series bounded (FE-14) and counts passes from the server's sets", () => {
+  it("keeps spend, agent spend and context series at or below the cap, with the newest point", () => {
+    const s = new RunState();
+    s.ingest(ev("run_started", { payload: { budget_usd: 1e9 } }));
+    const calls = SERIES_MAX * 2 + 500;
+    for (let i = 0; i < calls; i++) {
+      s.ingest(ev("llm_call_finished", { pid: `p${i % 7}`, agent: i % 2 ? "coder" : "ideas",
+        payload: { status: "ok", cost_usd: 0.001, input_tokens: 1000 + i, output_tokens: 10 } }));
+    }
+    const snap = s.snapshot();
+    assert.ok(snap.spendSeries.length <= SERIES_MAX, `spend series has ${snap.spendSeries.length} points`);
+    assert.ok(snap.context.length <= SERIES_MAX, `context series has ${snap.context.length} points`);
+    for (const list of Object.values(snap.agentSpend)) assert.ok(list.length <= SERIES_MAX);
+    assert.equal(snap.spendSeries.at(-1).spent, snap.spent, "the newest spend point is kept");
+    assert.equal(snap.context.at(-1).tokens, 1000 + calls - 1, "the newest context point is kept");
+    assert.equal(snap.llmCalls, calls, "the call count is not thinned with the series");
+    assert.equal(snap.largestContext, 1000 + calls - 1);
+  });
+
+  it("counts critic passes and validation passes from the statuses the server lists", () => {
+    const s = new RunState();
+    s.ingest(ev("pipeline_started", { pid: "a" }));
+    s.ingest(ev("pipeline_finished", { pid: "a", payload: { status: "validation_pass" } }));
+    s.ingest(ev("pipeline_started", { pid: "b" }));
+    s.ingest(ev("pipeline_finished", { pid: "b", payload: { status: "validation_fail" } }));
+    assert.equal(s.passedPipelines, 2, "both reached the critic gate: the server's critic set includes validation_fail");
+    assert.equal(s.validationPasses, 1);
   });
 });

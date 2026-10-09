@@ -4,6 +4,10 @@
 // Every pipeline is a card with eight stations. Events move packets between stations and set
 // each station's state. Effects carry a delay (`at`, in milliseconds) so the renderer can play
 // them in order even when a burst of events arrives at once.
+//
+// Which statuses count as passed comes from the server (core/contract.js, DECISION-13), never from this file.
+
+import { isPassedCritic, isPassedOutcome, isPassedValidation } from "../core/contract.js";
 
 export const STAGES = [
   { key: "idea", label: "idea", short: "IDEA", color: "--stage-idea" },
@@ -22,8 +26,11 @@ export const OK = "ok";
 export const FAIL = "fail";
 
 const AGENT_STATION = { ideas: 0, coder: 1, critic: 6 };
-const REVISION_STATION = { failed_static: 2, failed_sandbox: 3, failed_lookahead: 4, failed_gate: 5, failed_critic: 6 };
-const PASSED_STATUSES = new Set(["critic_pass", "validation_pass"]);
+// The station a revision (or a failed finish) marks red. Every failure status the server writes has one (R4-WHOLE-06).
+const REVISION_STATION = {
+  failed_static: 2, rejected_duplicate_code: 2, failed_sandbox: 3, failed_lookahead: 4,
+  failed_gate: 5, failed_backtest: 5, failed_critic: 6, failed_critic_output: 6,
+};
 const TIMING = { hubToCard: 520, packet: 420, node: 260, float: 0 };
 
 // The lookahead stage runs two tests. Only the perturbation test marks the station as passed.
@@ -48,6 +55,12 @@ export function finiteOr(value, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+// Text from a payload value. A missing value gives the fallback; any other value is turned into text, so a number
+// or an object never reaches a string method on the canvas (R4-FE-09).
+export function textOf(value, fallback = "") {
+  return value == null || value === "" ? fallback : String(value);
+}
+
 export function finiteOrNull(value) {
   if (value == null) return null;
   const n = Number(value);
@@ -69,11 +82,19 @@ export class TheatreModel {
     this.spent = 0;
     this.running = 0;
     this.done = 0;
-    this.passed = 0;
-    this.duplicates = 0;
+    this.passed = 0; // passed the critic gate
+    this.validated = 0; // passed validation
+    this.duplicatePipelines = new Set(); // pipelines that were caught as duplicate code
+    this.duplicateIdeas = 0; // idea duplicates, one per idea_rejected_duplicate event
     this.runStatus = "waiting";
     this.feed = []; // newest last, capped
     this.lastSeq = 0;
+  }
+
+  // Duplicates caught: each pipeline that was caught as duplicate code counts once, however many events said so
+  // (R4-FE-02), plus each idea the ideas agent rejected as a duplicate.
+  get duplicates() {
+    return this.duplicatePipelines.size + this.duplicateIdeas;
   }
 
   // Apply one event. Returns effects. With animate=false the state updates but no effects are
@@ -111,7 +132,7 @@ export class TheatreModel {
         const card = {
           id: pid,
           short: shortId(pid),
-          theme: p.theme || "",
+          theme: textOf(p.theme),
           idea: null,
           ideaId: null,
           status: "running",
@@ -132,14 +153,14 @@ export class TheatreModel {
       case "idea_created": {
         const card = this.cards.get(pid);
         if (!card) break;
-        card.idea = p.name || card.idea;
+        if (p.name != null && p.name !== "") card.idea = String(p.name);
         card.ideaId = event.idea_id || card.ideaId;
-        card.theme = card.theme || p.theme || "";
+        card.theme = card.theme || textOf(p.theme);
         this.setStation(card, 0, OK, "", emit);
         break;
       }
       case "idea_rejected_duplicate": {
-        this.duplicates += 1;
+        this.duplicateIdeas += 1;
         emit({ type: "hubtext", text: "duplicate idea rejected", tone: "warn", at: 0 });
         break;
       }
@@ -174,9 +195,17 @@ export class TheatreModel {
       case "static_check": {
         const card = this.cards.get(pid);
         if (!card) break;
-        const dup = !p.ok && (p.errors || []).some((e) => /duplicate code/i.test(e));
-        const text = p.ok ? "clean" : dup ? "dup" : "reject";
-        this.passStation(card, 2, p.ok ? OK : FAIL, text, emit, 1);
+        // A duplicate of an earlier program is reported by duplicate_code, not here (WHOLE-08).
+        this.passStation(card, 2, p.ok ? OK : FAIL, p.ok ? "clean" : "reject", emit, 1);
+        break;
+      }
+      case "duplicate_code": {
+        // The backend rejects a program that repeats an earlier attempt, before the static check runs.
+        if (pid) this.duplicatePipelines.add(pid);
+        else this.duplicateIdeas += 1;
+        const card = this.cards.get(pid);
+        if (card) this.passStation(card, 2, FAIL, "dup", emit, 1);
+        emit({ type: "hubtext", text: "duplicate code rejected", tone: "warn", at: 0 });
         break;
       }
       case "sandbox_run": {
@@ -242,14 +271,17 @@ export class TheatreModel {
         break;
       }
       case "pipeline_finished": {
+        const status = textOf(p.status, "finished");
+        // Counted from the finish too, so a duplicate the backend reports only as a status is still counted (R4-FE-02).
+        if (status === "rejected_duplicate_code" && pid) this.duplicatePipelines.add(pid);
         const card = this.cards.get(pid);
         if (!card) break;
-        const status = p.status || "finished";
         card.status = status;
         this.running = Math.max(0, this.running - 1);
         this.done += 1;
-        const passed = PASSED_STATUSES.has(status);
-        if (passed) this.passed += 1;
+        if (isPassedCritic(status)) this.passed += 1;
+        const passed = isPassedOutcome(status);
+        if (isPassedValidation(status)) this.validated += 1;
         const failedStation = REVISION_STATION[status];
         if (failedStation !== undefined && card.stations[failedStation].state !== FAIL) {
           this.setStation(card, failedStation, FAIL, card.stations[failedStation].text, emit);
@@ -305,6 +337,7 @@ export class TheatreModel {
       running: this.running,
       done: this.done,
       passed: this.passed,
+      validated: this.validated,
       total: this.total,
       spent: this.spent,
       budget: this.budget,
@@ -337,6 +370,7 @@ export function describe(event) {
     case "run_started": return "run started";
     case "run_finished": return `run ${p.status || "finished"}`;
     case "idea_rejected_duplicate": return "duplicate idea rejected";
+    case "duplicate_code": return "duplicate code rejected";
     default: return event.type ? String(event.type) : "event";
   }
 }

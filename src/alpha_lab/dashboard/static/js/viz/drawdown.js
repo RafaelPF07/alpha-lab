@@ -1,5 +1,6 @@
 // Underwater plot: how far each top signal sits below its own peak, over the same dates as the equity curves.
-import { COLORS, baseAxis, baseText, describeChart, plural, track } from "./common.js";
+import { COLORS, baseAxis, baseText, describeChart, track } from "./common.js";
+import { reachedText } from "../core/research_text.js";
 
 let chart = null;
 let container = null;
@@ -15,13 +16,13 @@ export function update(curves) {
   if (!chart) return;
   if (!curves || !curves.length) {
     // Clear the previous run's curves, so the chart and the run note never disagree (FE-03).
-    describeChart(container, "Drawdown: no validated signals in this run.");
+    describeChart(container, "Drawdown: no signal reached validation in this run.");
     chart.clear();
-    chart.setOption({ ...baseText(), title: { text: "no validated signals in this run", left: "center", top: "middle",
+    chart.setOption({ ...baseText(), title: { text: "no signal reached validation in this run", left: "center", top: "middle",
       textStyle: { color: COLORS.muted, fontSize: 13 } } });
     return;
   }
-  describeChart(container, `Drawdown for ${plural(curves.length, "validated signal")}, shown from each signal's own peak.`);
+  describeChart(container, `Drawdown for ${reachedText(curves.length)}, shown from each signal's own peak.`);
   chart.setOption({
     ...baseText(),
     grid: { left: 60, right: 20, top: 40, bottom: 40 },

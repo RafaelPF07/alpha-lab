@@ -78,6 +78,41 @@ describe("connectStream", () => {
     stop();
   });
 
+  // The server closes a stale or finished run's stream at once. Each open used to reset the failure count,
+  // so the page reopened it every second. The delay must now grow, as it does for any other failure.
+  it("a stream the server closes at once is retried with a growing delay, not every second", () => {
+    const stop = connectStream("run-stale", onBatch, { minRetryMs: 1000, maxRetryMs: 30000 });
+    const gaps = [];
+    for (let i = 0; i < 4; i++) {
+      last().open();
+      last().fail();
+      const before = sources().length;
+      let waited = 0;
+      while (sources().length === before && waited < 60000) {
+        mock.timers.tick(100);
+        waited += 100;
+      }
+      gaps.push(waited);
+    }
+    assert.deepEqual(gaps, [1000, 2000, 4000, 8000]);
+    stop();
+  });
+
+  it("a stream that stays open a while resets the delay for the next failure", () => {
+    const stop = connectStream("run-a", onBatch, { minRetryMs: 1000, maxRetryMs: 30000 });
+    last().fail();
+    mock.timers.tick(1000);
+    last().open();
+    mock.timers.tick(5000);
+    last().fail();
+    const before = sources().length;
+    mock.timers.tick(999);
+    assert.equal(sources().length, before, "the delay is back to the first step");
+    mock.timers.tick(1);
+    assert.equal(sources().length, before + 1);
+    stop();
+  });
+
   it("stop during the retry window never opens another stream (FE-01)", () => {
     const stop = connectStream("run-a", onBatch, { minRetryMs: 1000 });
     last().fail();

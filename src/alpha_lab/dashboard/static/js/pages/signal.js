@@ -1,6 +1,9 @@
 // Signal inspector: one idea, its attempts, the code diff between attempts, checks, critic and holdout status.
 import { fetchJson } from "../core/api.js";
+import { loadContract } from "../core/contract.js";
 import { esc } from "../core/escape.js";
+import { holdoutNote, callsTable } from "../core/signal_text.js";
+import { loadFailure } from "../core/ledgerprobe.js";
 import { signalIsDemo } from "../core/runs.js";
 import { showError, requireCharts } from "../core/page.js";
 import { COLORS, fmtNum, fmtPct, fmtUsd, statusColor, track } from "../viz/common.js";
@@ -68,7 +71,8 @@ function renderTree(attempts, onPick) {
     itemStyle: { color: statusColor(a.status) },
     attempt: a,
   }));
-  const root = { name: "idea", children, itemStyle: { color: COLORS.text } };
+  // The root label sits above its node, so the first edge does not run through it (R3-FE-07).
+  const root = { name: "idea", children, itemStyle: { color: COLORS.text }, label: { position: "top" } };
   const chart = track(echarts.init($("tree")));
   chart.setOption({
     tooltip: { trigger: "item" },
@@ -104,7 +108,7 @@ function metricsTable(train, validation, holdout) {
   row("max drawdown", cell(t, "max_drawdown", fmtPct), cell(v, "max_drawdown", fmtPct), h ? cell(h, "max_drawdown", fmtPct) : `<span class="locked">locked</span>`);
   row("avg daily turnover", cell(t, "avg_daily_turnover", (x) => fmtNum(x, 4)), cell(v, "avg_daily_turnover", (x) => fmtNum(x, 4)), h ? cell(h, "avg_daily_turnover", (x) => fmtNum(x, 4)) : `<span class="locked">locked</span>`);
   return `<table class="data"><thead><tr><th>metric</th><th class="num">train</th><th class="num">validation</th><th class="num">holdout</th></tr></thead><tbody>${rows.join("")}</tbody></table>
-    <p class="note">${holdout.status === "complete" ? "Holdout run recorded." : "Holdout not run for this signal. Its numbers stay hidden until the official holdout run."}</p>`;
+    <p class="note">${holdoutNote(holdout)}</p>`;
 }
 
 function renderSignal(data) {
@@ -125,7 +129,9 @@ function renderSignal(data) {
     $("diff").textContent = "No attempts recorded for this idea.";
   }
 
-  $("metrics").innerHTML = metricsTable(data.train_metrics, data.validation, data.holdout);
+  // The deflated Sharpe is run-level. When it is not defined, the reason is shown instead (DECISION-12).
+  const dsr = data.dsr_reason ? `<p class="note">Deflated Sharpe not defined for this run: ${esc(data.dsr_reason)}</p>` : "";
+  $("metrics").innerHTML = metricsTable(data.train_metrics, data.validation, data.holdout) + dsr;
 
   if (data.critic) {
     const concerns = (data.critic.concerns || []).map((c) => `<li>${esc(c)}</li>`).join("") || "<li>none</li>";
@@ -135,19 +141,18 @@ function renderSignal(data) {
     $("critic").innerHTML = `<p class="note">The critic did not review this attempt (it did not pass the training gate).</p>`;
   }
 
-  const calls = data.llm_calls.map((c) => `<tr><td>${esc(c.agent)}</td><td class="mono">${esc(c.model)}</td>
-    <td class="num">${c.input_tokens ?? "n/a"}</td><td class="num">${c.output_tokens ?? "n/a"}</td><td class="num">${fmtUsd(c.cost_usd)}</td></tr>`).join("");
-  $("calls").innerHTML = `<table class="data"><thead><tr><th>agent</th><th>model</th><th class="num">in</th><th class="num">out</th><th class="num">cost</th></tr></thead><tbody>${calls}</tbody></table>`;
+  $("calls").innerHTML = callsTable(data.llm_calls, fmtUsd);
 }
 
 async function init() {
   if (!id) { $("title").textContent = "Signal inspector: no id given"; return; }
   try {
+    await loadContract();
     requireCharts();
     renderSignal(await fetchJson(`/api/signals/${encodeURIComponent(id)}`));
   } catch (err) {
     $("title").textContent = "Signal inspector";
-    showError(`Could not load this signal. ${err.message}`);
+    showError(loadFailure("Could not load this signal", err));
   }
 }
 

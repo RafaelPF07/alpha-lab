@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { loadStatic } from "./_static.mjs";
+import { loadStatic, useFixtureContract } from "./_static.mjs";
 
 const { TheatreModel, IDLE, OK, FAIL, ACTIVE, describe: describeEvent } = await loadStatic("viz/theatre_model.js");
+await useFixtureContract();
 
 let seq = 0;
 const ev = (type, pid, extra = {}) => ({
@@ -50,10 +51,35 @@ function passingPipeline(m, pid) {
   assert.ok(Math.abs(card.cost - 0.010) < 1e-9, `cost was ${card.cost}`);
   const s = m.stats();
   assert.equal(s.passed, 1);
+  assert.equal(s.validated, 1);
   assert.equal(s.done, 1);
   assert.equal(s.running, 0);
   assert.equal(s.total, 2);
   console.log("ok: passing pipeline");
+}
+
+// 1b. The passed sets come from the server's contract, not from this file (DECISION-13).
+{
+  const { setContract, normaliseStatuses, normaliseLimits } = await loadStatic("core/contract.js");
+  setContract({ ...normaliseStatuses({ passed_critic: ["critic_pass"], passed_validation: [], validation_verdicts: [] }),
+    ...normaliseLimits({ pricing_tier_tokens: 1, context_limit_tokens: 2 }) });
+  const m = new TheatreModel();
+  m.apply(ev("pipeline_started", "pc", {}));
+  m.apply(ev("pipeline_finished", "pc", { payload: { status: "critic_pass" } }));
+  m.apply(ev("pipeline_started", "pv", {}));
+  m.apply(ev("pipeline_finished", "pv", { payload: { status: "validation_pass" } }));
+  assert.equal(m.stats().passed, 1, "the critic count follows the server's set, so validation_pass is not counted there");
+  assert.equal(m.stats().validated, 0, "nothing is validated when the server lists no validation pass");
+  await useFixtureContract();
+  console.log("ok: pass sets come from the contract");
+
+  // A validation failure passed the critic, but its card is red and it counts as a failure, not a pass.
+  const v = new TheatreModel();
+  v.apply(ev("pipeline_started", "pf", {}));
+  const effects = v.apply(ev("pipeline_finished", "pf", { payload: { status: "validation_fail" } }));
+  assert.equal(effects.find((e) => e.type === "burst").tone, "fail");
+  assert.equal(v.stats().validated, 0);
+  console.log("ok: a validation failure is red");
 }
 
 // 2. A static check fails, the coder is asked to revise, and the second attempt passes.
@@ -94,16 +120,25 @@ function passingPipeline(m, pid) {
   console.log("ok: training gate failure");
 }
 
-// 4. A duplicate code rejection is recognised from the static check message and counted.
+// 4. A duplicate code rejection (the backend's duplicate_code event, WHOLE-08) fails the static station,
+// is counted, and the revision keeps the static station red. The backend sends no static_check for it.
 {
   const m = new TheatreModel();
   const pid = "p4";
   m.apply(ev("pipeline_started", pid, { payload: { theme: "sector rotation" } }));
-  m.apply(ev("static_check", pid, { payload: { ok: false, errors: ["Duplicate code: this is the same program"] } }));
+  m.apply(ev("code_written", pid, { agent: "coder" }));
+  const effects = m.apply(ev("duplicate_code", pid, { payload: { earlier_attempt_id: "a1", message: "Duplicate code" } }));
+  assert.equal(m.cards.get(pid).stations[2].state, FAIL);
   assert.equal(m.cards.get(pid).stations[2].text, "dup");
+  assert.equal(m.stats().duplicates, 1, "a duplicate code is counted as a duplicate caught");
+  assert.ok(effects.some((e) => e.type === "packet" && e.from === 1 && e.to === 2), "the packet travels from code to static");
+  m.apply(ev("revision_requested", pid, { payload: { reason: "rejected_duplicate_code" } }));
+  assert.equal(m.cards.get(pid).stations[2].state, FAIL, "the revision keeps the static station red");
+  assert.equal(m.cards.get(pid).stations[1].state, ACTIVE, "the coder is asked to write it again");
+  m.apply(ev("pipeline_finished", pid, { payload: { status: "failed_error" } }));
   m.apply(ev("idea_rejected_duplicate", pid, { payload: { name: "copy" } }));
-  assert.equal(m.stats().duplicates, 1);
-  console.log("ok: duplicate detection");
+  assert.equal(m.stats().duplicates, 2, "idea duplicates and code duplicates are both counted");
+  console.log("ok: duplicate code is handled");
 }
 
 // 5. A backlog replayed silently produces the same state with no effects.

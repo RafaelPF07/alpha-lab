@@ -4,7 +4,10 @@ import { COLORS, agentColor, baseAxis, baseText, describeChart, plural, track } 
 let chart = null;
 let container = null;
 
-export function init(el, { pricingThreshold = 100000, contextLimit = 90000 } = {}) {
+// The thresholds come from the server (/api/limits, see core/contract.js). They are required here, so the chart
+// never marks a number of its own.
+export function init(el, { pricingThreshold, contextLimit }) {
+  if (!(pricingThreshold > 0) || !(contextLimit > 0)) throw new Error("context chart needs both thresholds");
   container = el;
   chart = track(echarts.init(el, null, { renderer: "canvas" }));
   chart.__thresholds = { pricingThreshold, contextLimit };
@@ -15,9 +18,7 @@ export function update(snapshot) {
   if (!chart) return;
   const { pricingThreshold, contextLimit } = chart.__thresholds;
   const agents = [...new Set(snapshot.context.map((c) => c.agent))];
-  let largest = 0;
-  for (const c of snapshot.context) if (c.tokens > largest) largest = c.tokens;
-  describeChart(container, `Context size: ${plural(snapshot.context.length, "LLM call")}, largest ${largest} input tokens. `
+  describeChart(container, `Context size: ${plural(snapshot.llmCalls, "LLM call")}, largest ${snapshot.largestContext} input tokens. `
     + `Marked: the pricing tier at ${pricingThreshold} tokens and the context limit at ${contextLimit}.`);
   const series = agents.map((agent) => ({
     name: agent,
@@ -34,7 +35,7 @@ export function update(snapshot) {
       symbol: "none",
       label: { color: COLORS.muted },
       data: [
-        { yAxis: pricingThreshold, name: "100K pricing tier", lineStyle: { color: COLORS.status.budget(), type: "solid" } },
+        { yAxis: pricingThreshold, name: `${pricingThreshold / 1000}K pricing tier`, lineStyle: { color: COLORS.status.budget(), type: "solid" } },
         { yAxis: contextLimit, name: "context limit", lineStyle: { color: COLORS.status.failed(), type: "dashed" } },
       ],
     },

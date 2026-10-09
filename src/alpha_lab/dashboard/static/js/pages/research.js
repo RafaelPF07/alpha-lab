@@ -1,8 +1,11 @@
 // Research views: post-run analysis of a finished run. Everything comes from the JSON endpoints.
 import { fetchJson, LatestRequest } from "../core/api.js";
+import { loadContract } from "../core/contract.js";
 import { esc } from "../core/escape.js";
 import { isDemoRun } from "../core/runs.js";
 import { showError, clearError, requireCharts } from "../core/page.js";
+import { loadFailure } from "../core/ledgerprobe.js";
+import { runNote, signalOutcome } from "../core/research_text.js";
 import * as galaxy from "../viz/galaxy.js";
 import * as luck from "../viz/luck.js";
 import * as equity from "../viz/equity.js";
@@ -21,13 +24,14 @@ let research = null; // the last research payload for the current run, reused wh
 
 const fmt2 = (x) => (Number.isFinite(x) ? x.toFixed(2) : "n/a");
 
-// A plain, keyboard-reachable list of the validated signals, so every point can be opened without the chart.
+// A plain, keyboard-reachable list of the signals that reached validation, so every point can be opened without
+// the chart. Each entry says whether its own validation passed (R4-FE-08).
 function renderSignalList(points) {
   $("signal-count").textContent = String(points.length);
   $("signal-list").innerHTML = points.length
     ? points.map((p) => `<li><a href="/signal?id=${encodeURIComponent(p.attempt_id)}">${esc(p.name || p.attempt_id)}</a>`
-      + ` <span class="note">train ${fmt2(p.train_sharpe)} · validation ${fmt2(p.validation_sharpe)}</span></li>`).join("")
-    : "<li>No validated signals in this run.</li>";
+      + ` <span class="note">${esc(signalOutcome(p))} · train ${fmt2(p.train_sharpe)} · validation ${fmt2(p.validation_sharpe)}</span></li>`).join("")
+    : "<li>No signal reached validation in this run.</li>";
 }
 
 async function load(runId) {
@@ -50,7 +54,8 @@ async function load(runId) {
   failures.update(res.failures);
   economics.update(res.economics);
   renderSignalList(res.galaxy.points);
-  $("run-note").textContent = `${res.galaxy.points.length} validated signal(s) · ${res.galaxy.luck.n_trials} trials in the ledger`;
+  // The deflated Sharpe is run-level: when it is not defined, the note says why (DECISION-12).
+  $("run-note").textContent = runNote(res.galaxy.points, res.galaxy.luck.n_trials, eq[0]?.dsr_reason);
   clearError();
 }
 
@@ -60,12 +65,14 @@ async function choose(runId) {
   try {
     await load(runId);
   } catch (err) {
-    if (current === runId) showError(`Could not load run ${runId}. ${err.message}`);
+    if (current === runId) showError(loadFailure(`Could not load run ${runId}`, err));
   }
 }
 
 async function init() {
   try {
+    // The status sets come from the server before the research counts are worded (DECISION-13).
+    await loadContract();
     requireCharts();
     galaxy.init($("galaxy"));
     luck.init($("luck"));
@@ -96,7 +103,7 @@ async function init() {
     for (const r of runs) {
       const opt = document.createElement("option");
       opt.value = r.run_id;
-      opt.textContent = `${r.run_id} · ${r.status}`;
+      opt.textContent = `${r.run_id} · ${r.status}${r.stale && r.status === "running" ? " · stale" : ""}`;
       select.appendChild(opt);
     }
     const chosen = params.get("run") || (runs[0] && runs[0].run_id);
@@ -105,7 +112,7 @@ async function init() {
       await choose(chosen);
     }
   } catch (err) {
-    showError(`Could not load the run list. ${err.message}`);
+    showError(loadFailure("Could not load the run list", err));
   }
 }
 

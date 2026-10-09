@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'">
   <title>Alpha Lab · Mission control</title>
+  <link rel="icon" href="/favicon.ico" type="image/svg+xml">
   <link rel="stylesheet" href="/static/css/tokens.css">
   <script defer src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
 </head>
@@ -40,7 +41,7 @@
     <section class="panel span-6"><h2>Cumulative spend</h2><p class="note">Dashed line projects spend at the current rate, for up to one more run length.</p><div id="spend" class="chart"></div></section>
     <section class="panel span-6"><h2>Cost by agent</h2><div id="spend-stack" class="chart"></div></section>
 
-    <section class="panel span-6"><h2>Context size</h2><p class="note">Input tokens per call. Solid line: the 100K pricing tier. Dashed: the context limit.</p><div id="context" class="chart"></div></section>
+    <section class="panel span-6"><h2>Context size</h2><p class="note">Input tokens per call. Solid line: the pricing tier. Dashed: the context limit. Both are set in config/settings.toml.</p><div id="context" class="chart"></div></section>
     <section class="panel span-6"><h2>Agent swarm</h2><p class="note">Orchestrator, one cluster per pipeline. Click a node to open its pipeline. From the keyboard, open a pipeline from the event ticker.</p><div id="swarm" class="chart"></div></section>
   </main>
 

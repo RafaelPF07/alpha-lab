@@ -2,6 +2,7 @@
 // the three agents and the three harness stages. Node colour is status, node size is tokens used.
 import { COLORS, describeChart, plural, track } from "./common.js";
 import { esc } from "../core/escape.js";
+import { isPassedOutcome } from "../core/contract.js";
 
 let chart = null;
 let container = null;
@@ -19,7 +20,7 @@ export function init(el) {
 
 function nodeColor(status) {
   if (status === "running") return COLORS.status.running();
-  if (status === "validation_pass" || status === "critic_pass") return COLORS.status.passed();
+  if (isPassedOutcome(status)) return COLORS.status.passed();
   if (!status) return COLORS.muted;
   return status.includes("budget") ? COLORS.status.budget() : COLORS.status.failed();
 }

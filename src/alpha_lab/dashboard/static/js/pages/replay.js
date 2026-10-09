@@ -1,9 +1,11 @@
 // Replay: rebuilds a finished run from its stored events, on the same visuals as mission control.
 // The clock moves at 1×, 10× or 100× real time, and the scrubber jumps anywhere in the run.
 import { fetchJson, LatestRequest } from "../core/api.js";
+import { loadContract } from "../core/contract.js";
 import { RunState } from "../core/state.js";
 import { isDemoRun } from "../core/runs.js";
 import { showError, clearError, requireCharts } from "../core/page.js";
+import { loadFailure } from "../core/ledgerprobe.js";
 import * as counters from "../viz/counters.js";
 import * as funnel from "../viz/funnel.js";
 import * as swimlanes from "../viz/swimlanes.js";
@@ -117,7 +119,7 @@ async function choose(runId) {
     dirty = true;
     clearError();
   } catch (err) {
-    if (latest.isCurrent(token)) showError(`Could not load run ${runId}. ${err.message}`);
+    if (latest.isCurrent(token)) showError(loadFailure(`Could not load run ${runId}`, err));
   }
 }
 
@@ -129,6 +131,7 @@ function markSpeed(button) {
 
 async function init() {
   try {
+    await loadContract();
     requireCharts();
     counters.init($("counters"));
     funnel.init($("funnel"));
@@ -166,7 +169,7 @@ async function init() {
     for (const r of runs) {
       const opt = document.createElement("option");
       opt.value = r.run_id;
-      opt.textContent = `${r.run_id} · ${r.status}`;
+      opt.textContent = `${r.run_id} · ${r.status}${r.stale && r.status === "running" ? " · stale" : ""}`;
       select.appendChild(opt);
     }
     const chosen = params.get("run") || (runs[0] && runs[0].run_id);
@@ -175,7 +178,7 @@ async function init() {
       await choose(chosen);
     }
   } catch (err) {
-    showError(`Could not load the run list. ${err.message}`);
+    showError(loadFailure("Could not load the run list", err));
   }
 }
 

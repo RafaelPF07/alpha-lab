@@ -21,10 +21,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from alpha_lab.agents.llm import Usage, compute_cost
 from alpha_lab.backtest.metrics import Metrics
 from alpha_lab.config import Settings, load_settings
 from alpha_lab.events.bus import EventBus, PipelineEvent
 from alpha_lab.ledger.db import LEDGER_PATH, Ledger
+from alpha_lab.pipeline.run import run_finished_payload
+from alpha_lab.statuses import VALIDATION_VERDICTS
 
 DEMO_RUN_ID = "demo"
 BUDGET_USD = 2.0
@@ -38,11 +41,6 @@ THEMES = [
     "trend filters",
     "pairs and relative value",
 ]
-MODELS = {"ideas": "claude-haiku-5-5", "coder": "claude-haiku-5-5", "critic": "claude-sonnet-5-5"}
-PRICES = {
-    "claude-haiku-5-5": (0.10, 0.50),
-    "claude-sonnet-5-5": (2.00, 10.00),
-}  # invented, USD per million tokens
 TOKENS = {  # (input range, output range) per agent
     "ideas": ((2500, 4800), (250, 700)),
     "coder": ((3000, 6000), (400, 1400)),
@@ -51,10 +49,11 @@ TOKENS = {  # (input range, output range) per agent
 TICKERS = ("AAPL", "MSFT", "JPM", "XOM")
 DUPLICATE_DRAFT_RATE = 0.125  # share of first drafts rejected as near copies of an earlier idea
 DUPLICATE_CODE_RATE = 0.2  # share of revisions that come back as the same program
+RETRY_EVERY = 9  # every this many simulated calls shows one transient error and a retry
 REFUSED_PIPELINE = 3  # its first coder call is refused, so the refusal path is always visible
 TRAIN_DAYS = pd.bdate_range("2010-01-01", "2018-12-31")[:400]
 VALIDATION_DAYS = pd.bdate_range("2019-01-01", "2021-12-31")
-LOOP_ENDS = ("validation_pass", "validation_fail")  # after these the revision loop stops
+LOOP_ENDS = VALIDATION_VERDICTS  # after these the revision loop stops
 ERRORS = {
     "failed_static": "Static check failed:\n- import of 'os' is not allowed",
     "rejected_duplicate_code": (
@@ -68,14 +67,9 @@ ERRORS = {
 }
 
 
-def _cost(agent: str, tokens_in: int, tokens_out: int) -> float:
-    p_in, p_out = PRICES[MODELS[agent]]
-    return (tokens_in * p_in + tokens_out * p_out) / 1_000_000
-
-
 def _returns(rng: np.random.Generator, index: pd.DatetimeIndex, drift: float) -> dict[str, float]:
     values = rng.normal(drift, 0.008, size=len(index))
-    return {str(d.date()): float(v) for d, v in zip(index, values)}
+    return {str(d.date()): float(v) for d, v in zip(index, values, strict=True)}
 
 
 def _demo_idea(rng: random.Random, n: int) -> dict:
@@ -128,7 +122,27 @@ class _Run:
     rng: random.Random
     np_rng: np.random.Generator
     pace: float
+    settings: Settings
     spent: float = 0.0
+    calls: int = 0  # counts simulated calls, so every RETRY_EVERY-th one can show a retry
+
+    @property
+    def models(self) -> dict[str, str]:
+        """The model each agent uses, from settings.toml, so the demo and the real run agree."""
+        agents = self.settings.agents
+        return {
+            "ideas": agents.ideas_model,
+            "coder": agents.coder_model,
+            "critic": agents.critic_model,
+        }
+
+    def cost(self, agent: str, tokens_in: int, tokens_out: int) -> float:
+        """USD for one call, priced by agents/llm.py compute_cost with the settings' pricing table."""
+        pricing = self.settings.pricing
+        usage = Usage(tokens_in, tokens_out, cache_read_tokens=0, cache_write_tokens=0)
+        return compute_cost(
+            pricing.models[self.models[agent]], usage, pricing.long_context_threshold_tokens
+        )
 
     def emit(
         self,
@@ -156,7 +170,7 @@ class _Run:
 
     def refuse(self, agent: str, pipeline_id: str, idea_id: str | None, reason: str) -> None:
         """A call refused before it was sent. It costs nothing, as agents/llm.py _refuse records it."""
-        call_id, model = uuid.uuid4().hex, MODELS[agent]
+        call_id, model = uuid.uuid4().hex, self.models[agent]
         self.ledger.add_llm_call(
             call_id=call_id,
             run_id=self.run_id,
@@ -185,9 +199,9 @@ class _Run:
         """One simulated model call, written and announced the way agents/llm.py does it."""
         (lo_in, hi_in), (lo_out, hi_out) = TOKENS[agent]
         tokens_in, tokens_out = self.rng.randint(lo_in, hi_in), self.rng.randint(lo_out, hi_out)
-        cost = _cost(agent, tokens_in, tokens_out)
+        cost = self.cost(agent, tokens_in, tokens_out)
         latency = self.rng.randint(900, 4200)
-        call_id, model, prompt = uuid.uuid4().hex, MODELS[agent], f"{agent}_v1"
+        call_id, model, prompt = uuid.uuid4().hex, self.models[agent], f"{agent}_v1"
         self.emit(
             "llm_call_started",
             "llm",
@@ -201,6 +215,23 @@ class _Run:
             idea_id=idea_id,
             agent=agent,
         )
+        self.calls += 1
+        if (
+            self.calls % RETRY_EVERY == 0
+        ):  # a transient error and one backoff, as agents/llm.py announces it
+            self.emit(
+                "llm_call_retrying",
+                "llm",
+                {
+                    "call_id": call_id,
+                    "attempt": 1,
+                    "delay_seconds": 2.0,
+                    "error_type": "RateLimitError",
+                },
+                pipeline_id=pipeline_id,
+                idea_id=idea_id,
+                agent=agent,
+            )
         self.ledger.add_llm_call(
             call_id=call_id,
             run_id=self.run_id,
@@ -514,6 +545,7 @@ async def run_demo(
         rng=random.Random(seed),
         np_rng=np.random.default_rng(seed),
         pace=pace,
+        settings=settings,
     )
     ledger.create_run(run_id, json.dumps({"demo": True, "pipelines": n_pipelines}), BUDGET_USD)
     run.emit(
@@ -543,4 +575,16 @@ async def run_demo(
         raise
     finally:
         ledger.finish_run(run_id, status, run.spent)
-        run.emit("run_finished", "run", {"status": status, "total_cost_usd": run.spent})
+        # The same four keys pipeline/run.py writes. The demo holds no budget reservations at the end.
+        run.emit(
+            "run_finished",
+            "run",
+            # The same payload the live run writes (pipeline/run.py run_finished_payload, R3-BE-06).
+            run_finished_payload(
+                status=status,
+                total_cost_usd=run.spent,
+                budget_usd=BUDGET_USD,
+                reserved_usd=0.0,
+                data_failed_pipelines=0,  # the demo never emits a failed_backtest
+            ),
+        )

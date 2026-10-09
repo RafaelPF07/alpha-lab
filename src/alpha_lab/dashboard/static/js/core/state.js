@@ -1,13 +1,25 @@
 // Turns the event stream into the numbers every mission-control chart needs.
 // Used by the live view and by replay, so both always show the same thing.
-
-const TRAIN_PASS = new Set(["critic_pass", "validation_pass", "validation_fail"]);
+import { isPassedCritic, isPassedValidation } from "./contract.js";
 
 // Funnel stages in order. Each stage counts distinct ideas (not events), and never exceeds the stage before it.
 export const FUNNEL = ["generated", "coded", "static", "sandbox", "lookahead", "train", "critic", "validation"];
 
 // The ticker and its filter see only the most recent events. Older events are not kept.
 export const RECENT_LIMIT = 5000;
+
+// Time series (spend, agent spend, context) keep at most this many points. When full, every other point is
+// dropped, so the whole run stays on the chart at half the resolution (FE-14).
+export const SERIES_MAX = 4000;
+
+// Adds one point to a series, thinning the series when it is full. The newest point is always kept.
+export function pushSeries(list, item) {
+  list.push(item);
+  if (list.length <= SERIES_MAX) return;
+  const kept = list.filter((_, i) => i % 2 === 0);
+  if (kept[kept.length - 1] !== item) kept.push(item);
+  list.splice(0, list.length, ...kept);
+}
 
 function finiteOr(value, fallback) {
   const n = Number(value);
@@ -28,12 +40,15 @@ export class RunState {
     this.pipelines = new Map(); // pipeline_id -> {id, started, finished, status, theme, ideaId, tokens, segments, markers}
     this.pipelineIdea = new Map(); // pipeline_id -> idea_id, for events that carry no idea_id
     this.stageIds = Object.fromEntries(FUNNEL.map((key) => [key, new Set()])); // distinct idea keys per stage
-    this.rejectedIdeas = 0;
+    this.rejectedIdeas = 0; // idea duplicates, one per idea_rejected_duplicate event
+    this.duplicatePipelines = new Set(); // pipelines caught as duplicate code, counted once each (as theatre_model.js)
     this.spent = 0;
     this.budget = null; // null until a run or budget event states it
     this.spendSeries = []; // {t, spent}
     this.agentSpend = {}; // agent -> [{t, cost}]
     this.context = []; // {t, agent, tokens}
+    this.llmCalls = 0; // every LLM call with an input size, not only the points kept in context
+    this.largestContext = 0;
     this.failures = {}; // stage -> count of attempts that ended there
     this.statusCounts = {};
     this.finished = false;
@@ -44,6 +59,11 @@ export class RunState {
 
   get ideas() {
     return this.stageIds.generated.size;
+  }
+
+  // Duplicates caught, counted the way the theatre counts them (R4-WHOLE-06).
+  get duplicates() {
+    return this.duplicatePipelines.size + this.rejectedIdeas;
   }
 
   ingest(event) {
@@ -72,12 +92,14 @@ export class RunState {
         this.runStatus = p.status || "finished";
         break;
       case "pipeline_started": {
-        this.pipelines.set(pid, { id: pid, started: t, finished: null, status: "running", theme: p.theme || null,
+        this.pipelines.set(pid, { id: pid, started: t, finished: null, status: "running",
+          theme: p.theme == null || p.theme === "" ? null : String(p.theme),
           ideaId: null, tokens: 0, segments: [], markers: [] });
         break;
       }
       case "pipeline_finished": {
-        const status = p.status || "done";
+        const status = String(p.status || "done");
+        if (status === "rejected_duplicate_code" && pid) this.duplicatePipelines.add(pid);
         const pl = this.pipelines.get(pid);
         if (pl) { pl.finished = t; pl.status = status; }
         this.statusCounts[status] = (this.statusCounts[status] || 0) + 1;
@@ -95,6 +117,10 @@ export class RunState {
       case "idea_rejected_duplicate":
         this.rejectedIdeas += 1;
         break;
+      case "duplicate_code":
+        if (pid) this.duplicatePipelines.add(pid);
+        else this.rejectedIdeas += 1;
+        break;
       case "llm_call_started":
         break;
       case "llm_call_finished": {
@@ -103,9 +129,14 @@ export class RunState {
         const agent = event.agent || "unknown";
         this.spent += cost;
         this.agentSpend[agent] = this.agentSpend[agent] || [];
-        this.agentSpend[agent].push({ t, cost });
-        this.spendSeries.push({ t, spent: this.spent });
-        if (p.input_tokens != null) this.context.push({ t, agent, tokens: finiteOr(p.input_tokens, 0) });
+        pushSeries(this.agentSpend[agent], { t, cost });
+        pushSeries(this.spendSeries, { t, spent: this.spent });
+        if (p.input_tokens != null) {
+          const input = finiteOr(p.input_tokens, 0);
+          this.llmCalls += 1;
+          this.largestContext = Math.max(this.largestContext, input);
+          pushSeries(this.context, { t, agent, tokens: input });
+        }
         const pl = this.pipelines.get(pid);
         if (pl) {
           pl.tokens += tokens;
@@ -170,12 +201,16 @@ export class RunState {
     return [...this.pipelines.values()].filter((pl) => pl.status !== "running").length;
   }
 
+  // Pipelines that passed the critic gate, by the server's status set (DECISION-13).
   get passedPipelines() {
-    return [...this.pipelines.values()].filter((pl) => TRAIN_PASS.has(pl.status)).length;
+    return [...this.pipelines.values()].filter((pl) => isPassedCritic(pl.status)).length;
   }
 
+  // Pipelines that passed validation, by the server's status set.
   get validationPasses() {
-    return this.statusCounts.validation_pass || 0;
+    let n = 0;
+    for (const [status, count] of Object.entries(this.statusCounts)) if (isPassedValidation(status)) n += count;
+    return n;
   }
 
   // Each stage's distinct-idea count, clamped so no stage exceeds the one before it.
@@ -215,6 +250,7 @@ export class RunState {
       validationPasses: this.validationPasses,
       ideas: this.ideas,
       rejectedIdeas: this.rejectedIdeas,
+      duplicates: this.duplicates,
       spent: this.spent,
       budget: this.budget,
       spendRate: this.spendRatePerMinute(),
@@ -222,6 +258,8 @@ export class RunState {
       spendSeries: this.spendSeries,
       agentSpend: this.agentSpend,
       context: this.context,
+      llmCalls: this.llmCalls,
+      largestContext: this.largestContext,
       funnel: this.funnelCounts(),
       failures: this.failures,
       statusCounts: this.statusCounts,

@@ -17,11 +17,15 @@ export function update(galaxy) {
   const expected = galaxy.luck.expected_max;
   const trials = galaxy.luck.n_trials ?? "?";
   const survivors = galaxy.points.filter((p) => p.passed && p.train_sharpe != null).map((p) => p.train_sharpe);
+  // No expected maximum (for example, fewer than two trials): no noise line, and the axis ignores zero (R4-F1).
+  const hasExpected = Number.isFinite(expected);
   // Loops, not spread arguments: a spread of a large array can exceed the engine's argument limit (FE-20).
   let lo = 0;
-  let hi = Math.max(0, expected ?? 0);
+  let hi = hasExpected ? expected : 0;
+  if (!hasExpected) { lo = Infinity; hi = -Infinity; }
   for (const s of sharpes) { if (s < lo) lo = s; if (s > hi) hi = s; }
   for (const s of survivors) { if (s < lo) lo = s; if (s > hi) hi = s; }
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) { lo = 0; hi = 1; } // no values at all: a plain axis
   lo -= 0.1;
   hi += 0.1;
   const bins = 24;
@@ -33,9 +37,10 @@ export function update(galaxy) {
 
   describeChart(container, `Luck distribution: ${plural(sharpes.length, "trial")}, `
     + `${plural(survivors.length, "survivor")}. Expected best from noise with ${trials} trials: `
-    + `${expected == null ? "n/a" : expected.toFixed(2)}.`);
+    + `${hasExpected ? expected.toFixed(2) : "n/a"}.`);
   chart.setOption({
     ...baseText(),
+    title: hasExpected ? undefined : { text: "noise max: n/a", right: 10, top: 4, textStyle: { color: COLORS.muted, fontSize: 12 } },
     grid: { left: 60, right: 20, top: 40, bottom: 50 },
     tooltip: { trigger: "axis" },
     xAxis: { type: "category", data: labels, name: "train Sharpe (annualised)", nameLocation: "middle", nameGap: 32,
@@ -52,7 +57,7 @@ export function update(galaxy) {
           symbol: "none",
           // Inside the plot, to the left of the line, so a line near the right edge does not clip its label.
           label: { color: COLORS.muted, position: "insideEndTop", rotate: 0, formatter: (p) => p.name },
-          data: expected == null ? [] : [{
+          data: !hasExpected ? [] : [{
             xAxis: indexOf(expected),
             name: `noise max (N=${trials}): ${expected.toFixed(2)}`,
             lineStyle: { color: COLORS.status.failed(), type: "dashed", width: 2 },

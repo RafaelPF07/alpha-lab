@@ -1,6 +1,7 @@
-// Signal galaxy: every validated signal, train Sharpe against validation Sharpe. Most points should
+// Signal galaxy: every signal that reached validation, train Sharpe against validation Sharpe. Most points should
 // fall below the y = x line, which is the visual evidence of overfitting decay.
-import { COLORS, baseAxis, baseText, describeChart, plural, track } from "./common.js";
+import { COLORS, baseAxis, baseText, describeChart, track } from "./common.js";
+import { reachedText } from "../core/research_text.js";
 import { esc } from "../core/escape.js";
 
 let chart = null;
@@ -63,7 +64,7 @@ export function update(galaxy) {
   });
 
   const below = points.filter((p) => p.validation_sharpe < p.train_sharpe).length;
-  describeChart(container, `Signal galaxy: ${plural(points.length, "validated signal")}, ${below} with lower validation `
+  describeChart(container, `Signal galaxy: ${reachedText(points.length)}, ${below} with lower validation `
     + "Sharpe than train Sharpe. Each one can be opened from the list below the chart.");
 
   chart.setOption({

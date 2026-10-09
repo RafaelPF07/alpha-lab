@@ -8,8 +8,12 @@ export async function fetchJson(url) {
     throw new Error(`${url} could not be reached (${err.message})`);
   }
   if (!res.ok) {
-    const error = new Error(`${url} -> ${res.status}`);
+    // The server's JSON error says why (FastAPI puts it in "detail"). Without it a page cannot name the fix (R4-FE-01).
+    const body = await Promise.resolve().then(() => res.json()).catch(() => null);
+    const detail = typeof body?.detail === "string" ? body.detail : "";
+    const error = new Error(`${url} -> ${res.status}${detail ? `: ${detail}` : ""}`);
     error.status = res.status;
+    error.detail = detail;
     throw error;
   }
   return res.json();
@@ -40,6 +44,8 @@ export class LatestRequest {
 //
 // onBatch(batch, { runId }) receives events in order. onStatus(state, { runId, delay? }) reports
 // "connecting", "live", "reconnecting" (with the delay in ms) and "finished" (run_finished arrived).
+const STABLE_MS = 5000; // how long a connection must stay open before it counts as healthy
+
 export function connectStream(runId, onBatch, options = {}) {
   const { after = 0, flushMs = 250, minRetryMs = 1000, maxRetryMs = 30000, onStatus = () => {} } = options;
   const url = `/events/stream?run_id=${encodeURIComponent(runId)}`;
@@ -51,6 +57,7 @@ export function connectStream(runId, onBatch, options = {}) {
   let stopped = false;
   let finished = false;
   let failures = 0;
+  let stableTimer = null; // resets the failure count once a connection has stayed open for a while
 
   const report = (state, detail = {}) => onStatus(state, { runId, ...detail });
 
@@ -78,8 +85,14 @@ export function connectStream(runId, onBatch, options = {}) {
 
     current.onopen = () => {
       if (source !== current) return;
-      failures = 0;
       report("live");
+      // The failure count resets only when this connection stays open. The server closes a stale or finished
+      // run's stream at once, so resetting on every open would reopen it every second (R4-F6 request).
+      clearTimeout(stableTimer);
+      stableTimer = setTimeout(() => {
+        stableTimer = null;
+        if (source === current) failures = 0;
+      }, STABLE_MS);
     };
 
     current.onmessage = (msg) => {
@@ -103,6 +116,8 @@ export function connectStream(runId, onBatch, options = {}) {
 
     current.onerror = () => {
       if (source !== current) return;
+      clearTimeout(stableTimer);
+      stableTimer = null;
       closeSource();
       if (stopped || finished) return;
       failures += 1;
@@ -117,6 +132,7 @@ export function connectStream(runId, onBatch, options = {}) {
     stopped = true;
     closeSource();
     clearTimeout(retryTimer);
+    clearTimeout(stableTimer);
     clearTimeout(flushTimer);
     retryTimer = null;
     flushTimer = null;

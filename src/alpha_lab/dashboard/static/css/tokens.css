@@ -238,3 +238,6 @@ details.signal-list li { margin: 3px 0; }
   header.topbar { padding: var(--space-3); }
   .page-error { margin: var(--space-3) var(--space-3) 0; }
 }
+
+/* A run or holdout the server reports as stale: marked, not hidden. */
+.stale { color: var(--warn-text); font-weight: 600; }
