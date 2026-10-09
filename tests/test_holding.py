@@ -37,6 +37,54 @@ def test_held_weights_never_use_a_later_day():
     pd.testing.assert_frame_equal(before.iloc[:30], after.iloc[:30])
 
 
+def long_a_with_nan_on_day_five() -> pd.DataFrame:
+    # Long A on every day, except NaN on day 5, which is a rebalance day when holding_days=5.
+    index = pd.bdate_range("2020-01-06", periods=12)
+    w = pd.DataFrame(0.0, index=index, columns=["A", "B"])
+    w["A"] = 1.0
+    w.iloc[5, 0] = np.nan
+    return w
+
+
+def test_nan_on_a_rebalance_day_is_flat_for_the_whole_holding_period():
+    # The engine treats NaN as flat. A NaN on day 5 must not carry day 0's weight forward.
+    held = hold_weights(long_a_with_nan_on_day_five(), 5)
+    assert held["A"].iloc[:5].tolist() == [1.0] * 5
+    assert held["A"].iloc[5:10].tolist() == [0.0] * 5
+
+
+def test_nan_rebalance_weight_does_not_earn_a_later_price_jump():
+    # A jumps 10% on day 6. The NaN on day 5 is flat, so the jump must not be earned.
+    index = pd.bdate_range("2020-01-06", periods=12)
+    prices = pd.DataFrame(100.0, index=index, columns=["A", "B"])
+    prices.iloc[6:, 0] = 110.0
+    cfg = BacktestConfig(
+        cost_bps_per_side=0.0, max_gross_leverage=1.0, annualization_days=252, min_history_days=0
+    )
+
+    held = hold_weights(long_a_with_nan_on_day_five(), 5)
+    net = run_backtest(held, prices, index[1].date(), index[-1].date(), cfg).net_returns
+
+    assert abs((1.0 + net).prod() - 1.0) < 1e-12
+
+
+def test_nan_and_infinite_weights_are_flat_at_every_holding_period():
+    w = make()
+    w.iloc[7, 1] = np.nan
+    w.iloc[10, 2] = np.inf
+    for holding_days in (1, 5):
+        assert np.isfinite(hold_weights(w, holding_days).to_numpy()).all()
+    assert hold_weights(w, 1).iloc[7, 1] == 0.0
+    assert hold_weights(w, 1).iloc[10, 2] == 0.0
+
+
+def test_all_nan_signal_holds_zero_at_every_holding_period():
+    w = make() * np.nan
+    zero = pd.DataFrame(0.0, index=w.index, columns=w.columns)
+    pd.testing.assert_frame_equal(hold_weights(w, 1), zero)
+    pd.testing.assert_frame_equal(hold_weights(w, 5), zero)
+
+
 def test_longer_holding_period_cuts_turnover():
     rng = np.random.default_rng(4)
     index = pd.bdate_range("2019-01-01", periods=400)

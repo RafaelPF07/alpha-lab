@@ -29,7 +29,8 @@ TRAIN_GATE_STATUSES = ("critic_pass", "failed_critic", "validation_pass", "valid
 CRITIC_STATUSES = ("critic_pass", "validation_pass", "validation_fail")
 CLUSTER_CORRELATION = 0.7
 TOP_N = 10
-ANNUALISATION = 252
+ANNUALISATION = 252  # fallback for runs whose config snapshot has no backtest settings
+MIN_VALIDATION_DAYS = 3  # fewer daily returns than this: the validation row is skipped (BE-02)
 
 
 @dataclass
@@ -62,6 +63,8 @@ class ReportData:
     trial_sharpe_variance: float = 0.0
     failures: list[tuple[str, int]] = field(default_factory=list)
     themes: list[dict] = field(default_factory=list)
+    skipped_validations: int = 0  # validation rows with no returns, or fewer than three
+    trial_train_days: float = 0.0  # median train days behind the trial variance (0 if unknown)
 
 
 def _series(data: str | None) -> pd.Series:
@@ -69,8 +72,44 @@ def _series(data: str | None) -> pd.Series:
         return pd.Series(dtype="float64")
     obj = json.loads(data)
     s = pd.Series(obj, dtype="float64")
-    s.index = pd.to_datetime(s.index)
+    s.index = pd.to_datetime(s.index, format="ISO8601")
     return s.sort_index()
+
+
+def _annualisation_of_run(config_json: str) -> int | None:
+    """backtest.annualization_days from a run's config snapshot, or None (demo and legacy runs)."""
+    try:
+        days = json.loads(config_json)["settings"]["backtest"]["annualization_days"]
+    except (KeyError, TypeError, ValueError):
+        return None
+    return int(days) if days else None
+
+
+def length_matched_variance(
+    trial_variance: float, trial_length: float, sample_length: float
+) -> float:
+    """Rescale the variance of trial Sharpe ratios from trial_length to sample_length returns.
+
+    Under noise the sampling variance of a per-period Sharpe ratio is about 1 / (T - 1), so the
+    variance scales with (T_trial - 1) / (T_sample - 1). This is DECISION-6. It assumes the spread
+    across trials is mostly sampling noise. The DSR formula itself is unchanged.
+    """
+    return trial_variance * (trial_length - 1.0) / (sample_length - 1.0)
+
+
+def _labels(candidates: list[CandidateRow]) -> list[str]:
+    """Unique labels for matrix rows and columns: the name, then the first eight characters of
+    the attempt id. Two candidates can share a name, so the name alone is not a key."""
+    labels: list[str] = []
+    seen: set[str] = set()
+    for c in candidates:
+        base = f"{c.name} ({c.attempt_id[:8]})"
+        label, n = base, 2
+        while label in seen:
+            label, n = f"{base} #{n}", n + 1
+        seen.add(label)
+        labels.append(label)
+    return labels
 
 
 def _clusters(corr: pd.DataFrame, threshold: float) -> list[list[str]]:
@@ -93,12 +132,24 @@ def _clusters(corr: pd.DataFrame, threshold: float) -> list[list[str]]:
     return [sorted(g) for g in groups.values() if len(g) > 1]
 
 
-def build_report_data(
-    ledger: Ledger, run_id: str, annualization: int = ANNUALISATION
-) -> ReportData:
+def _num(value: object) -> float:
+    """A stored metric as a float. The ledger writes null for a non-finite metric, which reads as NaN."""
+    return float(value) if value is not None else float("nan")
+
+
+def build_report_data(ledger: Ledger, run_id: str, annualization: int | None = None) -> ReportData:
     conn = ledger.conn
-    ideas = conn.execute("SELECT * FROM ideas WHERE run_id = ?", (run_id,)).fetchall()
-    attempts = conn.execute("SELECT * FROM attempts WHERE run_id = ?", (run_id,)).fetchall()
+    run = conn.execute("SELECT config_json FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    if annualization is None:  # the run's own setting, so the report uses the engine's units
+        own = _annualisation_of_run(run["config_json"]) if run is not None else None
+        annualization = own or ANNUALISATION
+    # Only the columns each step reads: no return series and no code (BE-04).
+    ideas = conn.execute("SELECT idea_id, theme FROM ideas WHERE run_id = ?", (run_id,)).fetchall()
+    attempts = conn.execute(
+        "SELECT idea_id, status, static_ok, sandbox_ok, lookahead_ok"
+        " FROM attempts WHERE run_id = ?",
+        (run_id,),
+    ).fetchall()
 
     def distinct(rows, predicate) -> int:
         return len({r["idea_id"] for r in rows if predicate(r)})
@@ -119,17 +170,28 @@ def build_report_data(
         for r in ledger.llm_cost_by_agent(run_id)
     ]
 
-    # Trials and the spread of Sharpe ratios across them, from the whole ledger (the honest denominator).
-    trial_sharpes = []
+    # Trials and the spread of their Sharpe ratios, from the whole ledger (the honest denominator).
+    # Each trial is converted to per-period units with its own run's annualisation.
+    run_annualisation = {
+        r["run_id"]: _annualisation_of_run(r["config_json"])
+        for r in conn.execute("SELECT run_id, config_json FROM runs")
+    }
+    trial_sharpes: list[float] = []
+    trial_days: list[float] = []
     for row in conn.execute(
-        "SELECT train_metrics_json FROM attempts WHERE train_metrics_json IS NOT NULL"
+        "SELECT run_id, train_metrics_json FROM attempts WHERE train_metrics_json IS NOT NULL"
     ):
-        sharpe = json.loads(row["train_metrics_json"])["sharpe"]
+        metrics = json.loads(row["train_metrics_json"])
+        sharpe = _num(metrics.get("sharpe"))
         if math.isfinite(sharpe):
-            trial_sharpes.append(sharpe / math.sqrt(annualization))  # per-period units
+            days = run_annualisation.get(row["run_id"]) or annualization
+            trial_sharpes.append(sharpe / math.sqrt(days))  # per-period units
+            if "n_days" in metrics:
+                trial_days.append(float(metrics["n_days"]))
     n_trials = ledger.count_trials()
     variance = float(np.var(trial_sharpes, ddof=1)) if len(trial_sharpes) > 1 else 0.0
     expected_max = expected_max_sharpe(n_trials, variance) * math.sqrt(annualization)
+    train_days = float(median(trial_days)) if trial_days else 0.0
 
     data = ReportData(
         run_id=run_id,
@@ -139,6 +201,7 @@ def build_report_data(
         expected_max_annual=expected_max,
         n_trials=n_trials,
         trial_sharpe_variance=variance,
+        trial_train_days=train_days,
     )
 
     failures = conn.execute(
@@ -148,51 +211,67 @@ def build_report_data(
     data.failures = [(r["status"], int(r["n"])) for r in failures]
 
     # Validation survivors (and every validated candidate) with their deflated Sharpe.
+    # Rows with no returns, or fewer than MIN_VALIDATION_DAYS, are skipped and counted (BE-02).
+    rows = conn.execute(
+        """SELECT v.metrics_json, v.returns_json, v.passed, a.attempt_id, a.idea_id,
+                  a.attempt_number, a.train_metrics_json, a.train_returns_json, i.name, i.theme
+           FROM validations v
+           JOIN attempts a ON a.attempt_id = v.attempt_id
+           JOIN ideas i ON i.idea_id = a.idea_id
+           WHERE v.run_id = ? AND v.metrics_json IS NOT NULL
+           ORDER BY v.created_at""",
+        (run_id,),
+    ).fetchall()
     candidates: list[CandidateRow] = []
-    for v in ledger.validations():
-        if v["run_id"] != run_id or v["metrics_json"] is None:
+    skipped = 0
+    for v in rows:
+        val_returns = _series(v["returns_json"])
+        if len(val_returns) < MIN_VALIDATION_DAYS:
+            skipped += 1
             continue
         metrics = json.loads(v["metrics_json"])
-        val_returns = _series(v["returns_json"])
-        attempt = conn.execute(
-            "SELECT * FROM attempts WHERE attempt_id = ?", (v["attempt_id"],)
-        ).fetchone()
-        train_returns = _series(attempt["train_returns_json"])
-        train_metrics = (
-            json.loads(attempt["train_metrics_json"]) if attempt["train_metrics_json"] else {}
+        train_metrics = json.loads(v["train_metrics_json"]) if v["train_metrics_json"] else {}
+        # DECISION-6: the trial variance was measured on train-length samples, so rescale it to
+        # this candidate's validation length before it sets the hurdle.
+        sample_variance = (
+            length_matched_variance(variance, train_days, len(val_returns))
+            if train_days
+            else variance
         )
-        skew, kurt = moments(val_returns) if len(val_returns) > 2 else (0.0, 3.0)
+        skew, kurt = moments(val_returns)
         dsr = deflated_sharpe_ratio(
-            sharpe=per_period_sharpe(val_returns) if len(val_returns) > 2 else 0.0,
+            sharpe=per_period_sharpe(val_returns),
             n_obs=len(val_returns),
             skew=skew,
             kurtosis=kurt,
             n_trials=max(n_trials, 2),
-            sharpe_variance=variance,
+            sharpe_variance=sample_variance,
         )
         candidates.append(
             CandidateRow(
                 name=v["name"],
                 theme=v["theme"] or "unknown",
-                idea_id=attempt["idea_id"],
-                attempt_id=attempt["attempt_id"],
-                train_sharpe=float(train_metrics.get("sharpe", float("nan"))),
-                validation_sharpe=float(metrics["sharpe"]),
+                idea_id=v["idea_id"],
+                attempt_id=v["attempt_id"],
+                train_sharpe=_num(train_metrics.get("sharpe")),
+                validation_sharpe=_num(metrics.get("sharpe")),
                 deflated_sharpe=float(dsr),
-                turnover=float(metrics["avg_daily_turnover"]),
-                revisions=int(attempt["attempt_number"]) - 1,
+                turnover=_num(metrics.get("avg_daily_turnover")),
+                revisions=int(v["attempt_number"]) - 1,
                 validation_returns=val_returns,
-                train_returns=train_returns,
+                train_returns=_series(v["train_returns_json"]),
                 passed=bool(v["passed"]),
             )
         )
     candidates.sort(key=lambda c: -(c.deflated_sharpe if math.isfinite(c.deflated_sharpe) else -1))
     data.candidates = candidates
+    data.skipped_validations = skipped
 
-    survivors = [c for c in candidates if c.passed and c.validation_returns.size > 2]
+    survivors = [c for c in candidates if c.passed]
     if len(survivors) >= 2:
-        frame = pd.concat({c.name: c.validation_returns for c in survivors}, axis=1)
-        data.correlation = frame.corr()
+        # Keyed by unique labels, so two survivors with the same name both reach the matrix.
+        labelled = dict(zip(_labels(survivors), (c.validation_returns for c in survivors)))
+        data.correlation = pd.concat(labelled, axis=1).corr()
         data.clusters = _clusters(data.correlation, CLUSTER_CORRELATION)
 
     themes: dict[str, dict] = {}
@@ -224,15 +303,15 @@ def build_report_data(
         t["val"].append(c.validation_sharpe)
         if math.isfinite(c.train_sharpe):
             t["train"].append(c.train_sharpe)
+    idea_theme = {i["idea_id"]: i["theme"] or "unknown" for i in ideas}
     for row in attempts:
+        theme = idea_theme.get(row["idea_id"])
+        if theme is None:
+            continue
         if row["status"] in CRITIC_STATUSES:
-            idea = next((i for i in ideas if i["idea_id"] == row["idea_id"]), None)
-            if idea is not None:
-                themes[idea["theme"] or "unknown"]["stage_pass"]["critic"] += 1
+            themes[theme]["stage_pass"]["critic"] += 1
         if row["status"] == "validation_pass":
-            idea = next((i for i in ideas if i["idea_id"] == row["idea_id"]), None)
-            if idea is not None:
-                themes[idea["theme"] or "unknown"]["stage_pass"]["validation"] += 1
+            themes[theme]["stage_pass"]["validation"] += 1
     data.themes = [
         {
             "theme": t["theme"],
@@ -274,11 +353,23 @@ def render_markdown(data: ReportData) -> str:
     lines += [
         "## Multiple testing",
         "",
-        f"- trials in the ledger (N): {data.n_trials}",
-        f"- variance of train Sharpe ratios across trials (per period): {data.trial_sharpe_variance:.6g}",
+        (
+            f"- trials in the ledger (N): {data.n_trials}. "
+            "N counts every trial that reached the sandbox."
+        ),
+        (
+            "- variance of train Sharpe ratios across trials (per period): "
+            f"{data.trial_sharpe_variance:.6g}. Only trials with a train backtest are in the "
+            "variance, so trials that failed the sandbox or the lookahead tests are not."
+        ),
         f"- expected maximum annualised Sharpe from pure noise at N: {data.expected_max_annual:.3f}",
-        "",
     ]
+    if data.trial_train_days:
+        lines.append(
+            "- validation DSRs rescale that variance from the median train length "
+            f"({data.trial_train_days:.0f} days) to each candidate's validation length."
+        )
+    lines.append("")
 
     lines += [
         f"## Top {TOP_N} by deflated Sharpe",
@@ -293,6 +384,11 @@ def render_markdown(data: ReportData) -> str:
         )
     if not data.candidates:
         lines.append("| (no signal reached validation) | | | | | | |")
+    lines.append("")
+    lines.append(
+        "- validation rows skipped (no returns, or fewer than three daily returns): "
+        f"{data.skipped_validations}"
+    )
 
     lines += ["", "## Correlation clusters (daily returns above 0.7)", ""]
     if data.clusters:
@@ -327,10 +423,29 @@ def render_markdown(data: ReportData) -> str:
         "## Known limitations",
         "",
         "- Survivorship bias: the universe is today's large caps, so results are optimistic.",
-        "- Daily close-to-close execution, fixed basis-point costs, no borrowing costs, no slippage beyond that.",
+        (
+            "- Same-bar execution: a weight decided from the close of day t earns the return from "
+            "close t to close t+1, so the decision and the fill share a bar. This flatters short "
+            "holding periods. No extra delay is modelled."
+        ),
+        (
+            "- Constant-mix returns: between rebalances the engine holds the target weights, which "
+            "is like trading back to target every day at no cost. Real books drift and the drift "
+            "trades are not charged. The equal-weight benchmark is constant-mix, not buy-and-hold."
+        ),
+        "- Fixed basis-point costs, no borrowing costs, no slippage beyond that.",
         "- Turnover ignores drift, so constant-weight signals show zero turnover.",
+        (
+            "- Adjusted closes are restated using later corporate actions, so level-based features "
+            "can see future actions. Ratio features over a window are not affected."
+        ),
         "- The LLM may have learned about the post-2010 market during training (subtle lookahead).",
-        "- The deflated Sharpe assumes the trial Sharpe ratios are the search space that was actually explored.",
+        (
+            "- The deflated Sharpe assumes the trial Sharpe ratios are the search space that was "
+            "actually explored. Its variance counts only trials with a train backtest, and it is "
+            "rescaled from train to validation length, which assumes the spread across trials is "
+            "mostly noise."
+        ),
         "- Small universe of 50 names. Results are not evidence of a tradable edge.",
         "",
     ]

@@ -2,12 +2,16 @@
 
 from datetime import date
 
+import numpy as np
 import pandas as pd
 import pytest
 
-from alpha_lab.backtest.engine import run_backtest, scale_to_gross
+from alpha_lab.backtest.engine import BacktestDataError, run_backtest, scale_to_gross
+from alpha_lab.backtest.holding import hold_weights
+from alpha_lab.checks.lookahead import run_lookahead_tests
 from alpha_lab.config import BacktestConfig, Dates
 from alpha_lab.data.splits import split_window
+from alpha_lab.signals.baselines import momentum_12_1, reversal_5d
 
 DAYS = pd.bdate_range("2020-01-06", periods=10)
 COLS = ["A", "B", "C"]
@@ -133,3 +137,132 @@ def test_weights_with_mismatched_shape_raise():
 
     with pytest.raises(ValueError, match="same index and columns"):
         run_backtest(weights, prices, date(2020, 1, 7), date(2020, 1, 17), cfg())
+
+
+def test_backtest_data_error_is_a_value_error():
+    assert issubclass(BacktestDataError, ValueError)
+
+
+def test_nan_on_the_day_before_the_window_raises():
+    # The first in-window return needs yesterday's price. A NaN there used to be
+    # scored silently as a zero return.
+    prices = frame([[100, 100, 100]] * 10)
+    prices.loc[DAYS[0], "B"] = float("nan")
+    weights = frame([[0.0, 0.0, 0.0]] * 10)
+
+    with pytest.raises(BacktestDataError, match="NaN"):
+        run_backtest(weights, prices, DAYS[1].date(), DAYS[-1].date(), cfg())
+
+
+def test_window_that_runs_past_the_last_price_raises():
+    prices = frame([[100, 100, 100]] * 10)
+    weights = frame([[0.0, 0.0, 0.0]] * 10)
+    too_late = (DAYS[-1] + pd.Timedelta(days=30)).date()
+
+    with pytest.raises(BacktestDataError, match="end"):
+        run_backtest(weights, prices, DAYS[1].date(), too_late, cfg())
+
+
+def test_window_that_starts_before_the_first_price_raises():
+    prices = frame([[100, 100, 100]] * 10)
+    weights = frame([[0.0, 0.0, 0.0]] * 10)
+    too_early = (DAYS[0] - pd.Timedelta(days=30)).date()
+
+    with pytest.raises(BacktestDataError, match="start"):
+        run_backtest(weights, prices, too_early, DAYS[-1].date(), cfg())
+
+
+def test_a_few_days_of_slack_at_the_window_edges_is_allowed():
+    # Weekends and market holidays: a window may end up to a week after the last price.
+    prices = frame([[100, 100, 100]] * 10)
+    weights = frame([[0.0, 0.0, 0.0]] * 10)
+    slack_end = (DAYS[-1] + pd.Timedelta(days=3)).date()
+
+    result = run_backtest(weights, prices, DAYS[1].date(), slack_end, cfg())
+
+    assert len(result.net_returns) == 9
+
+
+def test_window_with_fewer_than_two_scored_days_raises():
+    prices = frame([[100, 100, 100]] * 10)
+    weights = frame([[0.0, 0.0, 0.0]] * 10)
+
+    with pytest.raises(BacktestDataError):
+        run_backtest(weights, prices, DAYS[5].date(), DAYS[5].date(), cfg())
+
+
+def test_net_returns_before_a_cutoff_do_not_depend_on_later_prices():
+    # End to end: signal, then holding, then engine. Scrambling prices after the cutoff
+    # must not move any net return up to and including the cutoff.
+    rng = np.random.default_rng(11)
+    index = pd.bdate_range("2015-01-01", periods=420)
+    cols = [f"T{i}" for i in range(6)]
+    prices = pd.DataFrame(
+        100 * np.exp(np.cumsum(rng.normal(0, 0.01, (420, 6)), axis=0)), index=index, columns=cols
+    )
+    cutoff = 330
+    perturbed = prices.copy()
+    after = perturbed.index > index[cutoff]
+    perturbed.loc[after] = perturbed.loc[after].to_numpy() * (
+        1 + rng.normal(0, 0.05, (int(after.sum()), 6))
+    )
+
+    def net(px: pd.DataFrame) -> pd.Series:
+        held = hold_weights(momentum_12_1(px), 21)
+        return run_backtest(held, px, index[1].date(), index[-1].date(), cfg()).net_returns
+
+    base, changed = net(prices), net(perturbed)
+    up_to_cutoff = index[1 : cutoff + 1]
+    later = index[cutoff + 1 :]
+    pd.testing.assert_series_equal(base.loc[up_to_cutoff], changed.loc[up_to_cutoff])
+    assert not np.allclose(base.loc[later], changed.loc[later])  # the check is not vacuous
+
+
+def late_leak_from(leak_from: pd.Timestamp):
+    """Equal weight, except on and after `leak_from`, where it trades on tomorrow's return.
+
+    The leak is keyed on a fixed date, not on the length of the input, as a real leak would be.
+    """
+
+    def signal(prices: pd.DataFrame) -> pd.DataFrame:
+        weights = pd.DataFrame(1.0 / prices.shape[1], index=prices.index, columns=prices.columns)
+        tomorrow = prices.pct_change(fill_method=None).shift(-1)
+        late = prices.index >= leak_from
+        weights.loc[late] = np.sign(tomorrow.loc[late]).fillna(0.0).to_numpy()
+        return weights
+
+    return signal
+
+
+def test_lookahead_tests_see_a_leak_in_the_last_tenth_of_the_rows():
+    # Row 368 of 400 is 92%. The old cutoffs stopped at 90% (row 360), so nothing compared the leak.
+    rng = np.random.default_rng(3)
+    index = pd.bdate_range("2019-01-01", periods=400)
+    prices = pd.DataFrame(
+        100 * np.exp(np.cumsum(rng.normal(0.0003, 0.012, (400, 10)), axis=0)),
+        index=index,
+        columns=[f"T{i}" for i in range(10)],
+    )
+
+    results = run_lookahead_tests(late_leak_from(index[368]), prices)
+
+    assert not all(r.passed for r in results), results
+
+
+def test_reversal_buys_losers_and_momentum_buys_winners():
+    cols = ["T0", "T1", "T2", "T3", "T4"]
+    # reversal_5d: T0 fell 20% over the last five days and T4 rose 20%. Reversal buys T0.
+    days = pd.bdate_range("2020-01-01", periods=6)
+    path = np.full((6, 5), 100.0)
+    path[5, 0] = 80.0
+    path[5, 4] = 120.0
+    reversal = reversal_5d(pd.DataFrame(path, index=days, columns=cols)).iloc[-1]
+    assert reversal["T0"] > 0 > reversal["T4"]
+
+    # momentum_12_1: T0 rose 0.1% a day for a year and T4 fell by the same amount.
+    # Momentum buys the winner T0 and sells the loser T4.
+    days = pd.bdate_range("2019-01-01", periods=260)
+    drift = np.array([0.001, 0.0, 0.0, 0.0, -0.001])
+    path = 100.0 * np.exp(np.arange(260)[:, None] * drift[None, :])
+    momentum = momentum_12_1(pd.DataFrame(path, index=days, columns=cols)).iloc[-1]
+    assert momentum["T0"] > 0 > momentum["T4"]

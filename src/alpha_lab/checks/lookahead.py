@@ -28,8 +28,12 @@ class LookaheadResult:
 
 
 def _cutoffs(index: pd.DatetimeIndex, n: int) -> list[pd.Timestamp]:
-    """n cutoff dates spread across the middle of the data, away from the very start and end."""
-    positions = np.linspace(int(len(index) * 0.2), int(len(index) * 0.9), n).astype(int)
+    """n cutoff dates spread evenly from 15% to 95% of the rows.
+
+    The span reaches both tails, so a leak confined to late rows is compared. The first cutoff
+    stays past the 252-day lookback on the training window (about 350 rows of about 2,350).
+    """
+    positions = np.linspace(int(len(index) * 0.15), int(len(index) * 0.95), n).astype(int)
     return [index[p] for p in positions]
 
 

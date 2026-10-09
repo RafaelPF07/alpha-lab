@@ -19,6 +19,13 @@ def test_max_drawdown_hand_example():
     assert m.max_drawdown == pytest.approx(-0.05)
 
 
+def test_max_drawdown_counts_a_first_day_loss():
+    # The curve starts at 1.0, so the first day's fall is a drawdown: 0.95 / 1.0 - 1 = -5%.
+    # Without the 1.0 starting level the peak would be 0.95 and the drawdown would read 0.
+    m = compute_metrics(pd.Series([-0.05, 0.02]), pd.Series([0.0, 0.0]), 252)
+    assert m.max_drawdown == pytest.approx(-0.05)
+
+
 def test_hit_rate_and_turnover():
     m = compute_metrics(pd.Series([0.02, 0.0, 0.01, -0.01]), pd.Series([0.1, 0.3, 0.2, 0.4]), 252)
     assert m.hit_rate == pytest.approx(0.5)

@@ -65,7 +65,9 @@ def expected_max_sharpe(n_trials: int, sharpe_variance: float) -> float:
 
     V is the variance of the trials' Sharpe ratios, g is the Euler-Mascheroni
     constant, Z^-1 is the inverse standard normal CDF and e is Euler's number.
-    The expression comes from the expected maximum of N independent normal draws.
+    This is a Gumbel approximation to the expected maximum of N independent normal draws,
+    not an exact value. Against Monte Carlo it is about 0.04 low at N = 2 (0.520 against the
+    exact 1/sqrt(pi) = 0.564) and within about 0.04 for N from 10 to 500.
     """
     if n_trials < 2:
         return 0.0
@@ -95,6 +97,10 @@ def deflated_sharpe_ratio(
       g3      skewness of the returns (0 for a normal distribution)
       g4      kurtosis of the returns, NON-excess (3 for a normal distribution)
       Z       the standard normal CDF
+
+    sharpe_variance must be measured on samples of length n_obs. The sampling variance of a
+    per-period Sharpe under noise is about 1 / (T - 1), so a variance measured on a longer
+    training sample has to be rescaled first. The report does this (report.length_matched_variance).
 
     A DSR near 1 means the Sharpe is unlikely to be a lucky maximum over N trials.
     A DSR near 0.5 means the candidate is indistinguishable from the best noise trial.

@@ -88,17 +88,27 @@ def test_monte_carlo_noise_best_of_500_is_not_significant():
     assert honest < 0.95, (
         f"implementation is wrong if noise is called significant (DSR={honest:.3f})"
     )
+    assert honest > 0.05, f"implementation is wrong if noise is never plausible (DSR={honest:.3f})"
 
 
-def test_nonnormal_returns_change_the_result():
-    rng = np.random.default_rng(5)
-    base = rng.normal(0.0005, 0.01, 800)
-    skewed = np.where(base < -0.01, base * 3, base)  # fatter left tail
-    s_norm = per_period_sharpe(pd.Series(base))
-    s_skew = per_period_sharpe(pd.Series(skewed))
-    d_norm = deflated_sharpe_ratio(s_norm, 800, *moments(pd.Series(base)), 10, 0.0001)
-    d_skew = deflated_sharpe_ratio(s_skew, 800, *moments(pd.Series(skewed)), 10, 0.0001)
-    assert d_norm != pytest.approx(d_skew)
+def test_skew_and_kurtosis_enter_the_variance_term():
+    # Variance term = 1 - g3 * SR + (g4 - 1) / 4 * SR^2 = 1 + 0.15 + 0.0125 = 1.1625.
+    # DSR = Phi(0.1 * sqrt(799) / sqrt(1.1625)) = 0.995625. Ignoring the moments gives 0.997648.
+    assert deflated_sharpe_ratio(0.1, 800, -1.5, 6.0, 1, 0.0) == pytest.approx(0.995625, abs=1e-6)
+
+
+def test_a_non_positive_variance_term_gives_nan():
+    # Variance term = 1 - 2 * 1.0 + (3 - 1) / 4 * 1.0^2 = -0.5, so the normal approximation is void.
+    assert math.isnan(deflated_sharpe_ratio(1.0, 100, 2.0, 3.0, 1, 0.0))
+
+
+def test_dsr_uses_n_minus_one_observations():
+    # Sharpe 0.1 over 101 returns, so T - 1 = 100. One trial, so no deflation.
+    # Variance term = 1 + (3 - 1) / 4 * 0.1^2 = 1.005, so z = 0.1 * sqrt(100) / sqrt(1.005).
+    z = 0.1 * math.sqrt(100) / math.sqrt(1.005)
+    assert deflated_sharpe_ratio(0.1, 101, 0.0, 3.0, 1, 0.0) == pytest.approx(
+        _norm_cdf(z), abs=1e-12
+    )
 
 
 def test_moments_of_a_normal_sample_are_close_to_normal_values():
