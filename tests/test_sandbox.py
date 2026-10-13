@@ -580,17 +580,22 @@ def test_windows_cleanup_is_retried_once(prices, monkeypatch):
 # SandboxedSignal.run does not run the static filter, so these tests exercise the child alone.
 
 
-def test_process_creation_through_numpy_testing_is_refused(prices):
-    # R3-SEC-01, probe X2. The command is harmless, so the test shows only whether it ran.
+def test_process_creation_through_numpy_testing_is_refused(tmp_path, prices):
+    # R3-SEC-01, probe X2. The child would write a marker file, so the test checks that the
+    # process never ran, not which exception stopped it. On Windows the call reaches the process
+    # guard and raises PermissionError. On Linux numpy.testing is loaded lazily and the import
+    # guard can fail first with AttributeError, which also stops the process (CI, Ubuntu).
+    marker = tmp_path / "child_ran.txt"
+    command = [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('ran')"]
     code = (
         "import numpy\n\ndef signal(prices):\n"
-        f"    numpy.testing.extbuild.run_subprocess([{sys.executable!r}, '-c', 'print(1)'])\n"
+        f"    numpy.testing.extbuild.run_subprocess({command!r})\n"
         "    return prices * 0.0\n"
     )
     outcome = run(code, prices)
     assert outcome.status == "exception", outcome
-    assert outcome.error_type == "PermissionError"
-    assert "process creation" in outcome.message
+    assert outcome.error_type in {"PermissionError", "AttributeError"}, outcome
+    assert not marker.exists(), "the child process ran"
 
 
 def test_pyarrow_is_not_loaded_in_the_child(tmp_path, prices):
